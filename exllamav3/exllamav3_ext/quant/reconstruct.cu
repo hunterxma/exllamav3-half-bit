@@ -113,25 +113,27 @@ void reconstruct_batch_kernel
     reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0);
 }
 
-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 .. 7.5 (mul1 only)
 #define __(i, cb) reconstruct_batch_kernel<i, cb>
 constexpr auto reconstruct_batch_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
-    reconstruct_batch_kernel<1, 2, true>, reconstruct_batch_kernel<2, 2, true>, reconstruct_batch_kernel<3, 2, true>
+    reconstruct_batch_kernel<1, 2, true>, reconstruct_batch_kernel<2, 2, true>, reconstruct_batch_kernel<3, 2, true>,
+    reconstruct_batch_kernel<4, 2, true>, reconstruct_batch_kernel<5, 2, true>, reconstruct_batch_kernel<6, 2, true>, reconstruct_batch_kernel<7, 2, true>
 };
 #undef __
 
-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 .. 7.5 (mul1 only)
 #define __(i, cb) reconstruct_kernel<i, cb>
 constexpr auto reconstruct_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
-    reconstruct_kernel<1, 2, true>, reconstruct_kernel<2, 2, true>, reconstruct_kernel<3, 2, true>
+    reconstruct_kernel<1, 2, true>, reconstruct_kernel<2, 2, true>, reconstruct_kernel<3, 2, true>,
+    reconstruct_kernel<4, 2, true>, reconstruct_kernel<5, 2, true>, reconstruct_kernel<6, 2, true>, reconstruct_kernel<7, 2, true>
 };
 #undef __
 
@@ -403,25 +405,27 @@ void reconstruct_had_batch_kernel
     );
 }
 
-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 .. 7.5 (mul1 only)
 #define __(i, cb) reconstruct_had_batch_kernel<i, cb>
 constexpr auto reconstruct_had_batch_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
-    reconstruct_had_batch_kernel<1, 2, true>, reconstruct_had_batch_kernel<2, 2, true>, reconstruct_had_batch_kernel<3, 2, true>
+    reconstruct_had_batch_kernel<1, 2, true>, reconstruct_had_batch_kernel<2, 2, true>, reconstruct_had_batch_kernel<3, 2, true>,
+    reconstruct_had_batch_kernel<4, 2, true>, reconstruct_had_batch_kernel<5, 2, true>, reconstruct_had_batch_kernel<6, 2, true>, reconstruct_had_batch_kernel<7, 2, true>
 };
 #undef __
 
-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 .. 7.5 (mul1 only)
 #define __(i, cb) reconstruct_had_kernel<i, cb>
 constexpr auto reconstruct_had_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
-    reconstruct_had_kernel<1, 2, true>, reconstruct_had_kernel<2, 2, true>, reconstruct_had_kernel<3, 2, true>
+    reconstruct_had_kernel<1, 2, true>, reconstruct_had_kernel<2, 2, true>, reconstruct_had_kernel<3, 2, true>,
+    reconstruct_had_kernel<4, 2, true>, reconstruct_had_kernel<5, 2, true>, reconstruct_had_kernel<6, 2, true>, reconstruct_had_kernel<7, 2, true>
 };
 #undef __
 
