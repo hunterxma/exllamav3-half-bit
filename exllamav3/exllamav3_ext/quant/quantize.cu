@@ -293,6 +293,10 @@ void quantize_tiles_frac
         {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
         {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
         {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
+        {4, 0xaaaau, &quantize_tiles_frac_kernel_a4_maaaa},
+        {5, 0xaaaau, &quantize_tiles_frac_kernel_a5_maaaa},
+        {6, 0xaaaau, &quantize_tiles_frac_kernel_a6_maaaa},
+        {7, 0xaaaau, &quantize_tiles_frac_kernel_a7_maaaa},
     };
     for (const auto& e : table) if (e.ka == KA && e.mask == (uint32_t) MASK) kernel = e.fn();
     TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");

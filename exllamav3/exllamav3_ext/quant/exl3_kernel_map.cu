@@ -253,16 +253,20 @@ static fp_exl3_mgemm_kernel* const tab_mgemm_fp32[9][3] =
 EXL3_KERNEL_EXTERNS_H(1)
 EXL3_KERNEL_EXTERNS_H(2)
 EXL3_KERNEL_EXTERNS_H(3)
+EXL3_KERNEL_EXTERNS_H(4)
+EXL3_KERNEL_EXTERNS_H(5)
+EXL3_KERNEL_EXTERNS_H(6)
+EXL3_KERNEL_EXTERNS_H(7)
 
-// Half-integer bitrates: row K = integer part (K + 0.5 bpw), mul1 only
-static fp_exl3_gemm_kernel* const tab_gemm_fp32_h[4] =
-    { nullptr, tfp_exl3_gemm_kernel_fp32_h1, tfp_exl3_gemm_kernel_fp32_h2, tfp_exl3_gemm_kernel_fp32_h3 };
-static fp_exl3_gemm_kernel* const tab_gemm_fp16_h[4] =
-    { nullptr, tfp_exl3_gemm_kernel_fp16_h1, tfp_exl3_gemm_kernel_fp16_h2, tfp_exl3_gemm_kernel_fp16_h3 };
-static fp_exl3_mgemm_kernel* const tab_mgemm_fp32_h[4] =
-    { nullptr, tfp_exl3_mgemm_kernel_fp32_h1, tfp_exl3_mgemm_kernel_fp32_h2, tfp_exl3_mgemm_kernel_fp32_h3 };
-static fp_exl3_mgemm_kernel* const tab_mgemm_fp16_h[4] =
-    { nullptr, tfp_exl3_mgemm_kernel_fp16_h1, tfp_exl3_mgemm_kernel_fp16_h2, tfp_exl3_mgemm_kernel_fp16_h3 };
+// Half-integer bitrates: row K = integer part (K + 0.5 bpw, 1.5 .. 7.5), mul1 only
+static fp_exl3_gemm_kernel* const tab_gemm_fp32_h[8] =
+    { nullptr, tfp_exl3_gemm_kernel_fp32_h1, tfp_exl3_gemm_kernel_fp32_h2, tfp_exl3_gemm_kernel_fp32_h3, tfp_exl3_gemm_kernel_fp32_h4, tfp_exl3_gemm_kernel_fp32_h5, tfp_exl3_gemm_kernel_fp32_h6, tfp_exl3_gemm_kernel_fp32_h7 };
+static fp_exl3_gemm_kernel* const tab_gemm_fp16_h[8] =
+    { nullptr, tfp_exl3_gemm_kernel_fp16_h1, tfp_exl3_gemm_kernel_fp16_h2, tfp_exl3_gemm_kernel_fp16_h3, tfp_exl3_gemm_kernel_fp16_h4, tfp_exl3_gemm_kernel_fp16_h5, tfp_exl3_gemm_kernel_fp16_h6, tfp_exl3_gemm_kernel_fp16_h7 };
+static fp_exl3_mgemm_kernel* const tab_mgemm_fp32_h[8] =
+    { nullptr, tfp_exl3_mgemm_kernel_fp32_h1, tfp_exl3_mgemm_kernel_fp32_h2, tfp_exl3_mgemm_kernel_fp32_h3, tfp_exl3_mgemm_kernel_fp32_h4, tfp_exl3_mgemm_kernel_fp32_h5, tfp_exl3_mgemm_kernel_fp32_h6, tfp_exl3_mgemm_kernel_fp32_h7 };
+static fp_exl3_mgemm_kernel* const tab_mgemm_fp16_h[8] =
+    { nullptr, tfp_exl3_mgemm_kernel_fp16_h1, tfp_exl3_mgemm_kernel_fp16_h2, tfp_exl3_mgemm_kernel_fp16_h3, tfp_exl3_mgemm_kernel_fp16_h4, tfp_exl3_mgemm_kernel_fp16_h5, tfp_exl3_mgemm_kernel_fp16_h6, tfp_exl3_mgemm_kernel_fp16_h7 };
 
 static fp_exl3_mgemm_kernel* const tab_mgemm_fp16[9][3] =
 {
@@ -351,7 +355,7 @@ fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int c
 {
     if (half_k)
     {
-        TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer GEMM bitrate (1.5, 2.5, 3.5 bpw with mul1 only)");
+        TORCH_CHECK(K >= 1 && K <= 7 && cb == 2, "No kernel for half-integer GEMM bitrate (1.5 .. 7.5 bpw with mul1 only)");
         return (c_fp32 ? tab_gemm_fp32_h : tab_gemm_fp16_h)[K][shape_idx];
     }
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
@@ -363,7 +367,7 @@ fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int
 {
     if (half_k)
     {
-        TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer MGEMM bitrate (1.5, 2.5, 3.5 bpw with mul1 only)");
+        TORCH_CHECK(K >= 1 && K <= 7 && cb == 2, "No kernel for half-integer MGEMM bitrate (1.5 .. 7.5 bpw with mul1 only)");
         return (c_fp32 ? tab_mgemm_fp32_h : tab_mgemm_fp16_h)[K][shape_idx];
     }
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");

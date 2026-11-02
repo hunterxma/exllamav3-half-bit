@@ -253,8 +253,9 @@ __device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int
 
 // Half-integer bitrate KA + 0.5 (mul1 codebook): positions alternate KA and KA + 1 bits (odd positions carry the
 // extra bit), so 8 consecutive positions starting at an even index take 8 * KA + 4 bits and a lane's window
-// ends are fixed. Two groups of four windows, each spanning 18 + 3 * KA <= 27 bits = at most two 32-bit words:
-// one funnel shift per group, the other three windows derived by shifting the 32-bit result
+// ends are fixed. Two groups of four windows, each spanning 18 + 3 * KA bits: for KA <= 4 at most two 32-bit words,
+// one funnel shift per group, the other three windows derived by shifting the 32-bit result; KA >= 5 splits each
+// group into two pairs
 template <int KA, int cb>
 __device__ __forceinline__ void dq8_half(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
 {
@@ -264,15 +265,31 @@ __device__ __forceinline__ void dq8_half(const uint32_t* ptr, int t_offset, Frag
     const int e7 = ((t_offset >> 1) + 4) * bits2 + 128 * bits2;   // end bit of window 7 (+ one tile for the wrap)
     const int e3 = e7 - 2 * bits2;                                // end bit of window 3
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    if constexpr (gspan <= 32)
     {
-        int hi = (e7 - 1) / 32, lo = (e7 - gspan) / 32, s = (hi + 1) * 32 - e7;
-        uint32_t a = ptr[lo % words], b = ptr[hi % words];
-        w7 = fshift(b, a, s); w6 = w7 >> (KA + 1); w5 = w6 >> KA; w4 = w5 >> (KA + 1);
+        {
+            int hi = (e7 - 1) / 32, lo = (e7 - gspan) / 32, s = (hi + 1) * 32 - e7;
+            uint32_t a = ptr[lo % words], b = ptr[hi % words];
+            w7 = fshift(b, a, s); w6 = w7 >> (KA + 1); w5 = w6 >> KA; w4 = w5 >> (KA + 1);
+        }
+        {
+            int hi = (e3 - 1) / 32, lo = (e3 - gspan) / 32, s = (hi + 1) * 32 - e3;
+            uint32_t a = ptr[lo % words], b = ptr[hi % words];
+            w3 = fshift(b, a, s); w2 = w3 >> (KA + 1); w1 = w2 >> KA; w0 = w1 >> (KA + 1);
+        }
     }
+    else
     {
-        int hi = (e3 - 1) / 32, lo = (e3 - gspan) / 32, s = (hi + 1) * 32 - e3;
-        uint32_t a = ptr[lo % words], b = ptr[hi % words];
-        w3 = fshift(b, a, s); w2 = w3 >> (KA + 1); w1 = w2 >> KA; w0 = w1 >> (KA + 1);
+        // KA >= 5: four windows span more than 32 bits; take them in pairs (17 + KA <= 24 bits, one funnel shift
+        // each). Window ends within a group: e, e - (KA + 1), e - bits2, e - bits2 - (KA + 1)
+        constexpr int pspan = 17 + KA;
+        auto pair = [&](int e, uint32_t& wh, uint32_t& wl)
+        {
+            int hi = (e - 1) / 32, lo = (e - pspan) / 32, s = (hi + 1) * 32 - e;
+            wh = fshift(ptr[hi % words], ptr[lo % words], s); wl = wh >> (KA + 1);
+        };
+        pair(e7, w7, w6); pair(e7 - bits2, w5, w4);
+        pair(e3, w3, w2); pair(e3 - bits2, w1, w0);
     }
     half2 d0d1 = decode_3inst_2<cb>(w0 & 0xffff, w1 & 0xffff);
     half2 d2d3 = decode_3inst_2<cb>(w2 & 0xffff, w3 & 0xffff);

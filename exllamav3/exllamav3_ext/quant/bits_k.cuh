@@ -14,8 +14,8 @@ inline BitsK bits_from_K(float K)
 {
     const int bits = (int) K;
     const float f = K - (float) bits;
-    TORCH_CHECK(bits >= 1 && bits <= 8 && (f == 0.0f || (f == 0.5f && bits <= 3)),
-                "Unsupported EXL3 bitrate ", K, " (integer 1..8, or 1.5 / 2.5 / 3.5)");
+    TORCH_CHECK(bits >= 1 && bits <= 8 && (f == 0.0f || (f == 0.5f && bits <= 7)),
+                "Unsupported EXL3 bitrate ", K, " (integer 1..8, or a half-integer 1.5 .. 7.5)");
     return { bits, f == 0.5f };
 }
 

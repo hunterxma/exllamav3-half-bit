@@ -8,8 +8,8 @@ import re
 if TYPE_CHECKING:
     from ..model import Model, Config
 
-# Half-integer trellis rates with kernel instances (mul1 codebook only); above 3.5 bpw the steps are whole bits
-HALF_RATES = (1.5, 2.5, 3.5)
+# Half-integer trellis rates with kernel instances (mul1 codebook only): 1.5 .. 7.5 (4.5+ added in the half-rates-hi fork)
+HALF_RATES = (1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5)
 
 
 def _as_rate(r: float):
@@ -17,14 +17,14 @@ def _as_rate(r: float):
 
 
 def rate_floor(bpw: float, half_steps: bool):
-    """Largest supported bitrate <= bpw: integers 1..8, plus 1.5 / 2.5 / 3.5 when half_steps"""
-    r = math.floor(bpw * 2) / 2 if half_steps and bpw < 4 else math.floor(bpw)
+    """Largest supported bitrate <= bpw: integers 1..8, plus the half rates 1.5 .. 7.5 when half_steps"""
+    r = math.floor(bpw * 2) / 2 if half_steps and bpw < 8 else math.floor(bpw)
     return _as_rate(max(1, min(8, r)))
 
 
 def rate_next(bpw: float, half_steps: bool):
     """The next supported bitrate above bpw (8 stays 8)"""
-    return _as_rate(min(8, bpw + (0.5 if half_steps and bpw < 4 else 1)))
+    return _as_rate(min(8, bpw + (0.5 if half_steps and bpw < 8 else 1)))
 
 
 @dataclass

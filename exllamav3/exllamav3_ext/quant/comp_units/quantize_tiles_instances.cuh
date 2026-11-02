@@ -43,3 +43,7 @@ fp_quantize_tiles_kernel quantize_tiles_kernel_k8_cb2_l160(bool optimized = fals
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a1_maaaa();
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a2_maaaa();
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a3_maaaa();
+fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a4_maaaa();
+fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a5_maaaa();
+fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a6_maaaa();
+fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a7_maaaa();
