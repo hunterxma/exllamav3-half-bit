@@ -39,6 +39,9 @@ fp_quantize_tiles_kernel quantize_tiles_kernel_k7_cb2_l160(bool optimized = fals
 fp_quantize_tiles_kernel quantize_tiles_kernel_k8_cb2_l160(bool optimized = false);
 
 
+// Fractional-rate quantizer: cost rows in shared memory from KA = 2 up (see quantize_tiles_frac_kernel.cuh)
+#define QTF_SMEM_COSTS(KA) ((KA) >= 2)
+
 // Fractional-rate instances (mul1 codebook only): quantize_tiles_frac_kernel<KA, MASK>, rate KA + popcount(MASK)/16
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a1_maaaa();
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a2_maaaa();

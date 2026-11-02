@@ -37,40 +37,27 @@ __device__ __forceinline__ void qt_frac_step
     const int thread
 )
 {
+    // Minimum over the 2^KOUT candidates of each out-edge pair as one packed integer, (half cost bits << 16) | in-edge
+    // (costs are non-negative halves, so unsigned order is cost order): branch-free, like the sm_120 integer kernels
     constexpr int Kr = 16 - KOUT;
     constexpr int max_q = 1 << KOUT;
     constexpr int edges_out = 65536 >> KOUT;
     const half2 w2 = __half2half2(w);
     const half2 inf2 = __half2half2(H_INF);
+    constexpr uint32_t product_step = 0x83DCD12Du << Kr;
 
     for (int out_edge_idx = 2 * thread; out_edge_idx < edges_out; out_edge_idx += 2 * QTF_NT)
     {
-        int in_edge_idx = out_edge_idx >> KIN;
         uint32_t product0 = out_edge_idx * 0x83DCD12Du;
         uint32_t product1 = product0 + 0x83DCD12Du;
-        half2 decoded2 = decode_mul1_product_2(product0, product1);
-        half2 dh2 = __hsub2(decoded2, w2);
-        half2 min_err2;
-        if (first)
-        {
-            min_err2 = __hmul2(dh2, dh2);
-            if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = inf2;
-        }
-        else
-            min_err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-        int min_in_edge0 = in_edge_idx;
-        int min_in_edge1 = in_edge_idx;
-
+        uint32_t best0 = 0xffffffffu, best1 = 0xffffffffu;
         #pragma unroll
-        for (int k = 1; k < max_q; ++k)
+        for (int k = 0; k < max_q; ++k)
         {
-            const int state0 = (k << Kr) | out_edge_idx;
-            in_edge_idx = state0 >> KIN;
-            constexpr uint32_t product_step = 0x83DCD12Du << Kr;
+            const int in_edge_idx = ((k << Kr) | out_edge_idx) >> KIN;
+            const half2 dh2 = __hsub2(decode_mul1_product_2(product0, product1), w2);
             product0 += product_step;
             product1 += product_step;
-            decoded2 = decode_mul1_product_2(product0, product1);
-            dh2 = __hsub2(decoded2, w2);
             half2 err2;
             if (first)
             {
@@ -79,24 +66,13 @@ __device__ __forceinline__ void qt_frac_step
             }
             else
                 err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-            if (__hlt(__low2half(err2), __low2half(min_err2)))
-            {
-                min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));
-                min_in_edge0 = in_edge_idx;
-            }
-            if (__hlt(__high2half(err2), __high2half(min_err2)))
-            {
-                min_err2 = __halves2half2(__low2half(min_err2), __high2half(err2));
-                min_in_edge1 = in_edge_idx;
-            }
+            best0 = min(best0, ((uint32_t) __half_as_ushort(__low2half(err2)) << 16) | (uint32_t) in_edge_idx);
+            best1 = min(best1, ((uint32_t) __half_as_ushort(__high2half(err2)) << 16) | (uint32_t) in_edge_idx);
         }
-
-        reinterpret_cast<half2*>(costs_out)[out_edge_idx >> 1] = min_err2;
+        reinterpret_cast<half2*>(costs_out)[out_edge_idx >> 1] =
+            __halves2half2(__ushort_as_half((uint16_t) (best0 >> 16)), __ushort_as_half((uint16_t) (best1 >> 16)));
         if (write_hist)
-        {
-            hist_row[out_edge_idx] = (uint16_t) min_in_edge0;
-            hist_row[out_edge_idx + 1] = (uint16_t) min_in_edge1;
-        }
+            reinterpret_cast<uint32_t*>(hist_row)[out_edge_idx >> 1] = (best0 & 0xffffu) | (best1 << 16);
     }
 }
 
@@ -134,7 +110,10 @@ void quantize_tiles_frac_kernel
     half* sh_input_tile = (half*) sh; sh += L * sizeof(half);
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
-    half* temp_costs = temp_costs_ptr + (size_t) 2 * edges_max * tile_idx;
+    // Cost rows in shared memory from KA = 2 up (2 x 16384 half = 64 KB at most); KA = 1 keeps the caller's global scratch
+    half* temp_costs;
+    if constexpr (QTF_SMEM_COSTS(KA)) { temp_costs = (half*) sh; sh += 2 * edges_max * sizeof(half); }
+    else temp_costs = temp_costs_ptr + (size_t) 2 * edges_max * tile_idx;
     half* temp_costs_inc = temp_costs + edges_max;
 
     for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
