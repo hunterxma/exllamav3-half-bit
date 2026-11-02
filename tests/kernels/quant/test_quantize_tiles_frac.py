@@ -23,11 +23,11 @@ from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules.quant.exl3_lib.quantize import get_temp_buffers_frac, quantize_tiles
 from testlib import trellis as tref
 
-HALF_K = [1.5, 2.5, 3.5]
+HALF_K = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
 # Unit Gaussian tiles. The Gaussian rate-distortion function halves the MSE per half bit; the integer-K quantizer
 # sits at ~0.28 / 0.068 / 0.018 for K = 1 / 2 / 3, so the half rates are bounded at roughly the geometric mean of
 # their neighbours with headroom
-max_mse = {1.5: 0.2, 2.5: 0.05, 3.5: 0.013}
+max_mse = {1.5: 0.2, 2.5: 0.05, 3.5: 0.013, 4.5: 0.0034, 5.5: 0.00088, 6.5: 0.00023, 7.5: 0.00006}
 
 
 def _q(x, K):

@@ -18,7 +18,7 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 from testlib import trellis as tref
 
-CASES = [(K, cb) for K in range(1, 9) for cb in tref.CODEBOOKS] + [(K, "mul1") for K in (1.5, 2.5, 3.5)]
+CASES = [(K, cb) for K in range(1, 9) for cb in tref.CODEBOOKS] + [(K, "mul1") for K in (1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5)]
 
 
 def _trellis(k, n, K, seed):
@@ -85,7 +85,7 @@ def test_rejections(device):
     p25 = torch.zeros((k // 16, n // 16, 40), dtype = torch.int16, device = device)
     rejects(w128, p25, 2.5, False, False, 0, "require the mul1 codebook")
     rejects(w128, p25, 2.5, True, False, 0, "require the mul1 codebook")
-    for bad_K in (0, 9, 4.5, 2.25):
+    for bad_K in (0, 9, 8.5, 2.25):
         rejects(w128, pt, bad_K, False, True, 0, "Unsupported EXL3 bitrate")
 
 

@@ -22,7 +22,7 @@ from exllamav3.ext import exllamav3_ext as ext
 from testlib import trellis as tref
 
 INT_K = list(range(1, 9))
-HALF_K = [1.5, 2.5, 3.5]
+HALF_K = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
 SHAPES = [(1, 1), (3, 5), (17, 33)]
 
 

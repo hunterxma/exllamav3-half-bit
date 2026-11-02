@@ -49,6 +49,22 @@ def test_gemm_matches_reconstruct(device, codebook, K, m):
     assert rel < 0.02, f"K={K} m={m} {codebook}: relative RMS error {rel:.4f}"
 
 
+@pytest.mark.parametrize("K", [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5])
+@pytest.mark.parametrize("m", [1, 8, 16, 32, 200])
+@torch.inference_mode()
+def test_gemm_half_matches_reconstruct(device, K, m):
+    """Half-integer rates (mul1): GEMM kernel vs dequantize-then-matmul. 4.5+ take the GEMM path at every m"""
+    k, n = 512, 512
+    gen = generator(int(K * 200) + m)
+    w = rand_linear(k, n, K, gen, device)
+    A = (torch.randn((m, k), generator = gen) * 0.5).half().to(device)
+    C = _gemm(A, w, False, True)
+    ref = linear_ref(A, w["trellis"], w["suh"], w["svh"], K, "mul1")
+    err = (C.float() - ref.float()).square().mean().sqrt()
+    rel = (err / ref.float().square().mean().sqrt()).item()
+    assert rel < 0.02, f"K={K} m={m}: relative RMS error {rel:.4f}"
+
+
 @pytest.mark.parametrize("K", [2, 4])
 @torch.inference_mode()
 def test_gemm_deterministic(device, K):

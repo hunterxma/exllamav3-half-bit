@@ -22,7 +22,7 @@ from testlib.exl3 import CODEBOOKS, checkpoint_tensors, generator, linear_ref
 
 KEY = "model.layers.0.mlp.up_proj"
 ROWS = [1, 2, 8, 16, 17, 31, 32, 33, 256, 2048]
-BITRATES = [(K, cb) for K in range(1, 9) for cb in CODEBOOKS] + [(K, "mul1") for K in (1.5, 2.5, 3.5)]
+BITRATES = [(K, cb) for K in range(1, 9) for cb in CODEBOOKS] + [(K, "mul1") for K in (1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5)]
 
 
 def rel_rms(a, b) -> float:
