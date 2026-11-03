@@ -75,9 +75,10 @@ if command -v uv >/dev/null; then
   [ -x "$VENV/bin/python" ] || uv venv -q -p 3.12 "$VENV"
   PIP=(uv pip install -p "$VENV/bin/python")
 else
-  PY=$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3 || true)
-  [ -n "$PY" ] || die "no python3 found (3.10 .. 3.13 supported)"
-  "$PY" -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 13)' 2>/dev/null || die "$PY is not Python 3.10 .. 3.13"
+  # every dependency (torch included) ships wheels for 3.10 .. 3.14; prefer the most widely tested
+  PY=$(command -v python3.12 || command -v python3.13 || command -v python3.11 || command -v python3.14 || command -v python3.10 || command -v python3 || true)
+  [ -n "$PY" ] || die "no python3 found (3.10 .. 3.14 supported)"
+  "$PY" -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 14)' 2>/dev/null || die "$PY is $("$PY" -V 2>&1); 3.10 .. 3.14 is supported"
   [ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV" || die "python venv module missing (Debian/Ubuntu: apt install python3-venv)"
   "$VENV/bin/python" -m pip install -q --upgrade pip
   PIP=("$VENV/bin/python" -m pip install)
