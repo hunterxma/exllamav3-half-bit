@@ -36,7 +36,11 @@ static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
         {
             case 1: return exl3_moe_coop_kernel_a_h1(Hi, wide);
             case 2: return exl3_moe_coop_kernel_a_h2(Hi, wide);
-            default: return exl3_moe_coop_kernel_a_h3(Hi, wide);
+            case 3: return exl3_moe_coop_kernel_a_h3(Hi, wide);
+            case 4: return exl3_moe_coop_kernel_a_h4(Hi, wide);
+            case 5: return exl3_moe_coop_kernel_a_h5(Hi, wide);
+            case 6: return exl3_moe_coop_kernel_a_h6(Hi, wide);
+            default: return exl3_moe_coop_kernel_a_h7(Hi, wide);   // bits_from_K admits half rates up to 7.5 only
         }
     }
     switch (K)
@@ -63,7 +67,11 @@ static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
         {
             case 1: return exl3_moe_coop_kernel_b_h1(wide);
             case 2: return exl3_moe_coop_kernel_b_h2(wide);
-            default: return exl3_moe_coop_kernel_b_h3(wide);
+            case 3: return exl3_moe_coop_kernel_b_h3(wide);
+            case 4: return exl3_moe_coop_kernel_b_h4(wide);
+            case 5: return exl3_moe_coop_kernel_b_h5(wide);
+            case 6: return exl3_moe_coop_kernel_b_h6(wide);
+            default: return exl3_moe_coop_kernel_b_h7(wide);   // bits_from_K admits half rates up to 7.5 only
         }
     }
     switch (K)

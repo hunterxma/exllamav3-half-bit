@@ -1,7 +1,7 @@
 #pragma once
 #include <c10/util/Exception.h>
 
-// Bitrate K of an EXL3 tensor: an integer 1..8, or a half-integer 1.5 / 2.5 / 3.5 (mul1 codebook only). Python
+// Bitrate K of an EXL3 tensor: an integer 1..8, or a half-integer 1.5 .. 7.5 (mul1 codebook only). Python
 // passes LinearEXL3.K (int or float); the C++ boundary takes it as float and decomposes it once here into the
 // integer part and the half flag the kernel tables are indexed by
 struct BitsK

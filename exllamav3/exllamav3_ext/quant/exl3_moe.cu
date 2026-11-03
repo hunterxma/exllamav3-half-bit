@@ -435,10 +435,14 @@ void exl3_moe
         kernel = exl3_moe_kernel_instances[4 * (half_k ? 0 : K) + 2 * cb_idx + N_off];
     }
 #else
+    // Uniform half-integer rates have compile-time instances for 1.5 / 2.5 / 3.5; 4.5 .. 7.5 run through the
+    // runtime-K instance (index 0), which takes the rates from K2_gate / K2_up / K2_down
+    const bool half_inst = half_k && K <= 3;
+    const int K_inst = half_k ? 0 : K;
     if (m_tile <= 16)
     {
-        kernel = half_k ? exl3_moe_kernel_instances_h[2 * (K - 1) + N_off]
-                        : exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+        kernel = half_inst ? exl3_moe_kernel_instances_h[2 * (K - 1) + N_off]
+                           : exl3_moe_kernel_instances[4 * K_inst + 2 * cb_idx + N_off];
     }
     else
     {
@@ -448,10 +452,10 @@ void exl3_moe
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
-        if (half_k)
+        if (half_inst)
             kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
         else
-            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K_inst] : exl3_moe_kernel_instances_m32[K_inst];
     }
 #endif
 

@@ -1,6 +1,6 @@
 """
-Half-integer bitrates (1.5 / 2.5 / 3.5 bpw, mul1) in the fused MoE prefill kernel (ext.exl3_moe), whose instances
-are compiled per rate: single 16-row launches, per-range 16 / 32 / 64-row tiles and the mixed-rate runtime-switch
+Half-integer bitrates (1.5 .. 7.5 bpw, mul1) in the fused MoE prefill kernel (ext.exl3_moe), whose instances
+are compiled per rate up to 3.5 (4.5 .. 7.5 take the runtime-K instance): single 16-row launches, per-range 16 / 32 / 64-row tiles and the mixed-rate runtime-switch
 instance, against the dense reconstruct path (testlib.moe.expert_mlp_ref). The CPU expert kernels at these rates
 are covered in tests/moe_cpu/test_half_rates_cpu.py.
 """
@@ -11,7 +11,7 @@ from exllamav3.ext import exllamav3_ext as ext
 from testlib.exl3 import rand_experts, rand_scale, rand_trellis
 from testlib.moe import contiguous_layout, expert_mlp_ref, expert_ptr_tables, experts_to, moe_buffers
 
-HALF_RATES = (1.5, 2.5, 3.5)
+HALF_RATES = (1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5)   # 1.5 .. 3.5 compiled instances, 4.5+ the runtime-K instance
 CAP = 128
 
 

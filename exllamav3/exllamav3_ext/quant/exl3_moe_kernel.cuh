@@ -48,7 +48,8 @@ void moe_gemm_tile
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
     // Compile-time rate: t_bits, or t_bits + 0.5 with t_half (mul1 codebook only). Otherwise the runtime K
     // arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
-    // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks)
+    // half-integer rates 1.5 .. 7.5 (mul1 codebook only, the host checks). Every odd value needs a case:
+    // a missing one would skip the GEMM and leave the output unwritten
     if constexpr (t_bits)
         exl3_gemm_kernel_inner<t_bits, t_half, false, cb, SHAPE_ARGS, false>(ARGS);
     else switch(K)
@@ -64,6 +65,10 @@ void moe_gemm_tile
         case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
         case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
         case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 9:  if constexpr (cb == 2) exl3_gemm_kernel_inner<4, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 11: if constexpr (cb == 2) exl3_gemm_kernel_inner<5, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 13: if constexpr (cb == 2) exl3_gemm_kernel_inner<6, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 15: if constexpr (cb == 2) exl3_gemm_kernel_inner<7, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
     };
     #undef ARGS
     #undef SHAPE_ARGS

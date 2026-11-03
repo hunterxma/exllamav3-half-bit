@@ -47,7 +47,7 @@ class Module(ABC):
         self.num_slices = 1
         self.select_hq_bits = 0
         self.q_priority = 0
-        self.q_half_bits = True     # may be quantized at a half-integer bitrate (all decode kernels have instances)
+        self.q_half_bits = True     # may be quantized at a half-integer bitrate (GPU kernels cover 1.5 .. 7.5; CPU expert offload takes 1.5 .. 3.5 only and declines higher half rates)
         self.layer_idx = None
 
     def __iter__(self):

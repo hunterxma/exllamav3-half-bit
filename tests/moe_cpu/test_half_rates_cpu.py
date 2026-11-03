@@ -57,6 +57,8 @@ def cpu_outputs():
 def test_trellis_rate():
     assert [trellis_rate(16 * k) for k in range(1, 9)] == list(range(1, 9))
     assert [trellis_rate(w) for w in (24, 40, 56)] == [1.5, 2.5, 3.5]
+    # 4.5 .. 7.5 (tile widths 72 .. 120) have GPU kernels only: the CPU offload declines them (experts stay on the GPU)
+    assert [trellis_rate(w) for w in (72, 88, 104, 120)] == [None] * 4
     for w in (0, 8, 72, 136, 144, 20, 60):
         assert trellis_rate(w) is None
 

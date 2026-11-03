@@ -125,6 +125,19 @@ def test_bits_and_codebooks(device, K, cb):
     run_case(device, K * 10 + cb, K, K, K, cb)
 
 
+@pytest.mark.parametrize("K", [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5])
+def test_half_rates(device, K):
+    # Half-integer rates (mul1 only): one fused-decode instance per rate. 4.5 .. 7.5 once fell through to the
+    # 3.5 instance and decoded garbage
+    run_case(device, int(K * 10) + 7, K, K, K, 2)
+
+
+def test_mixed_half_k(device):
+    run_case(device, 3, 4.5, 4.5, 6.5, 2)
+    run_case(device, 4, 7.5, 7.5, 4, 2)
+    run_case(device, 5, 5, 5, 5.5, 2)
+
+
 def test_mixed_k(device):
     # gate and up share a width (the converter allocates them as one group); down may differ
     run_case(device, 1, 3, 3, 5, 1)

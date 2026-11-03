@@ -80,8 +80,8 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py, or hand-written), used in place of the budgeted allocation from --bits / --head_bits. Tensor keys may be wildcard patterns, resolved top to bottom (later entries override).")
-parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
-parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
+parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, a half rate 1.5 .. 7.5 (mul1 codebook), or 16 to store unquantized, default: 6")
+parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, a half rate 1.5 .. 7.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", type = int, nargs = "?", const = 1, default = 0, help = "Increase bitrate of select layers for supported models (MoE mostly): each promoted module's floor rises by its select_hq_bits above the base rate; -hq 2 doubles the promotion (-hq N: N times)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
@@ -1440,7 +1440,7 @@ def main(args, job_state):
         strategy, final_bpw = create_q_strategy(
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
+            half_steps = args["codebook"] == "mul1",   # half rates 1.5 .. 7.5 exist for the mul1 codebook only
         )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
