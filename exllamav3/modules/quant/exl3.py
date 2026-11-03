@@ -9,6 +9,10 @@ from ...util import profile_opt
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
+# Cap on the fp16 weight a prefill reconstruct materialises at once (EXL3_RECON_TEMP_MB, default 64): wider matrices are
+# reconstructed and multiplied in 128-column slices. Same arithmetic per output column; the peak drops from k*n*2 bytes
+# (170 MiB for a 17408 x 5120 down projection) to the cap, which is what lets a 15.4 GB model keep 24k context on 16 GB
+RECON_TEMP_BYTES = int(os.environ.get("EXL3_RECON_TEMP_MB", "64")) << 20
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
@@ -194,7 +198,8 @@ class LinearEXL3:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
 
-        if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
+        slice_n = min(MAX_RECONSTRUCT_SLICE_N, max(128, RECON_TEMP_BYTES // (2 * self.in_features) // 128 * 128))
+        if self.out_features <= slice_n:
             w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
             if use_fused:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
@@ -202,10 +207,10 @@ class LinearEXL3:
                 self._reconstruct_inner(w, 0)
             ext.hgemm_recon(xh, w, y_)
         else:
-            numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
+            numel_ = self.in_features * slice_n
             w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
-            for n_start in range(0, self.out_features, MAX_RECONSTRUCT_SLICE_N):
-                n_end = min(n_start + MAX_RECONSTRUCT_SLICE_N, self.out_features)
+            for n_start in range(0, self.out_features, slice_n):
+                n_end = min(n_start + slice_n, self.out_features)
                 numel = self.in_features * (n_end - n_start)
                 w = w_[:numel].view(self.in_features, n_end - n_start)
                 if use_fused:
