@@ -3,7 +3,9 @@ Post-install self-test: python -m exllamav3.util.selftest
 
 Checks that the compiled extension loads on this GPU and that every EXL3 bitrate (integer 2..8 and the half rates
 1.5 .. 7.5) quantizes and decodes correctly through the kernels a model actually uses:
-  quantize : Viterbi quantizer on unit-Gaussian tiles, MSE within the per-rate bound
+  quantize : Viterbi quantizer on unit-Gaussian tiles clamped to +-3 (the codebook's range, as regularized weights
+             are), MSE within the per-rate bound and strictly falling with the rate (each half rate between its
+             integer neighbours)
   gemm     : exl3_gemm (prefill / batched path) vs the dequantize-then-matmul reference, m = 1 and 32
 The full test suite (tests/, pytest) covers GEMV, MoE, caches and modules.
 Exit code 0 = all passed. Runs in about 10-30 s.
@@ -14,9 +16,11 @@ import time
 import torch
 
 RATES = [2, 3, 4, 5, 6, 7, 8, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
-# Unit-Gaussian tile MSE bounds (generous: the measured values are ~20-30% lower)
-MSE_MAX = {2: 0.09, 3: 0.025, 4: 0.0065, 5: 0.0018, 6: 0.0006, 7: 0.00030, 8: 0.00022,
-           1.5: 0.2, 2.5: 0.05, 3.5: 0.013, 4.5: 0.0030, 5.5: 0.0009, 6.5: 0.00034, 7.5: 0.00019}
+# MSE bounds on clamped unit-Gaussian tiles: 1.25x the worst of 8 seeds (RTX 5060 Ti). Unclamped
+# tiles are a poor test at high rates: the few samples past the codebook's range dominate the error, so the
+# MSE of one draw swings ~2x at 7-8 bpw
+MSE_MAX = {2: 0.086, 3: 0.0217, 4: 0.00555, 5: 0.00143, 6: 0.00037, 7: 0.000099, 8: 0.000026,
+           1.5: 0.173, 2.5: 0.0432, 3.5: 0.011, 4.5: 0.00281, 5.5: 0.00073, 6.5: 0.00019, 7.5: 0.000051}
 
 
 def main() -> int:
@@ -51,13 +55,14 @@ def main() -> int:
         ext.reconstruct_had_slice(w, tr, suh, svh, K, False, True, 0)
         return w
 
+    mses = {}
     with torch.inference_mode():
+        x = torch.randn((64, 256), generator = gen).clamp(-3, 3).to(dev)   # one draw for every rate: comparable
         for K in RATES:
             # quantize
-            x = torch.randn((64, 256), generator = gen).to(dev)
-            y, _ = quantize_tiles(x, {"K": K, "mul1": True})
+            y, _ = quantize_tiles(x.clone(), {"K": K, "mul1": True})
             mse = (y.float() - x).square().mean().item()
-            ok_q = mse < MSE_MAX[K]
+            ok_q = mse < MSE_MAX[K]; mses[K] = mse
             # gemm vs dense reference
             k, n = 512, 512
             tr, suh, svh = rand_trellis(k, n, K), rand_scale(k), rand_scale(n)
@@ -71,9 +76,14 @@ def main() -> int:
                 rel = ((C.float() - ref).square().mean().sqrt() / ref.square().mean().sqrt()).item()
                 worst = max(worst, rel)
             ok_g = worst < 0.02 and torch.isfinite(C).all().item()
-            print(f"  {K:>4} bpw  quantize mse {mse:.5f} {'ok' if ok_q else 'FAIL'}   gemm rel err {worst:.4f} {'ok' if ok_g else 'FAIL'}")
+            print(f"  {K:>4} bpw  quantize mse {mse:.2e} {'ok' if ok_q else 'FAIL'}   gemm rel err {worst:.4f} {'ok' if ok_g else 'FAIL'}")
             if not (ok_q and ok_g): fails.append(K)
         torch.cuda.synchronize()
+    order = sorted(mses)
+    for lo, hi in zip(order, order[1:]):
+        if not mses[hi] < mses[lo]:
+            print(f"  FAIL: {hi} bpw (mse {mses[hi]:.2e}) is not better than {lo} bpw ({mses[lo]:.2e})")
+            fails.append(hi)
 
     dt = time.time() - t0
     if fails:
