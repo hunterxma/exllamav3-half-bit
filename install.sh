@@ -84,7 +84,7 @@ else
   PIP=("$VENV/bin/python" -m pip install)
 fi
 say "venv: $VENV; installing $TORCH_SPEC ($IDX)"
-"${PIP[@]}" "$TORCH_SPEC" --index-url "https://download.pytorch.org/whl/$IDX" >/dev/null
+"${PIP[@]}" "$TORCH_SPEC" numpy --index-url "https://download.pytorch.org/whl/$IDX" >/dev/null   # numpy now: torch warns on import without it
 TCUDA=$("$VENV/bin/python" -c 'import torch; print(torch.version.cuda or "")')
 [ "${TCUDA%%.*}" = "${PICKV%%.*}" ] || die "PyTorch was built for CUDA $TCUDA but the toolkit is $PICKV (majors must match)"
 "${PIP[@]}" -q setuptools wheel ninja
