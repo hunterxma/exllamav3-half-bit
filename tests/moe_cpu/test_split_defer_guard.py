@@ -29,6 +29,8 @@ class _StubSTC:
 
 class _Sub:
     """Submodule stand-in recording whether the stc was deferring when it loaded"""
+    device = None   # Module.load skips a child already placed on the attention device
+    caps = {}
     def __init__(self, stc):
         self.stc = stc
         self.loaded_deferred = None

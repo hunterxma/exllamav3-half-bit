@@ -3,6 +3,10 @@
 Everything here runs under pytest from the repository root. Tests exercise the source tree, not an installed
 copy, and need no hard-coded paths or devices: models come from a registry, devices from options.
 
+Setup: `pip install -r requirements_tests.txt` into the same environment as the built extension. Tests that
+JIT-compile CUDA (e.g. `kernels/portability`) use `CUDA_HOME`; `install.sh` sets it in the venv's activate script,
+otherwise export the toolkit the extension was built with (an older `nvcc` on `PATH` cannot target new GPUs).
+
 ```sh
 pytest tests                                   # everything this machine can run (missing models/GPUs skip)
 pytest tests/kernels                           # one subsystem by directory

@@ -113,6 +113,7 @@ def _split_gdn() -> Any:
     module.qkv_proj = _linear("gdn.qkv")
     module.z_proj = _linear("gdn.z")
     module.o_proj = _linear("gdn.o")
+    module.kda_direct = False
     return module
 
 
@@ -122,6 +123,7 @@ def _fused_gdn() -> Any:
     module.qkv_proj = None
     module.z_proj = None
     module.o_proj = _linear("gdn.o")
+    module.kda_direct = False
     return module
 
 
@@ -179,6 +181,7 @@ def test_qwen38_optimizer_topology_has_expected_unique_groups_and_linears() -> N
             attn.qkv_proj = linear(f"{prefix}.gdn.qkv")
             attn.z_proj = linear(f"{prefix}.gdn.z")
             attn.o_proj = linear(f"{prefix}.gdn.o")
+            attn.kda_direct = False
         else:
             assert layer_type == "full_attention"
             attn = attention_class()

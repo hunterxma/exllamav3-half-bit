@@ -98,6 +98,10 @@ if ! TORCH_CUDA_ARCH_LIST=$ARCH MAX_JOBS=$JOBS "${PIP[@]}" --no-build-isolation 
   die "build failed; the first errors are above, full log in $LOG"
 fi
 
+# JIT-compiled kernels (tests, extensions loaded at runtime) must use the same toolkit as the build, not whatever
+# nvcc is first on PATH
+grep -q "EXL3 install.sh" "$VENV/bin/activate" || printf '\n# EXL3 install.sh: CUDA toolkit the extension was built with\nexport CUDA_HOME="%s"\nexport PATH="$CUDA_HOME/bin:$PATH"\n' "$CUDA_HOME" >> "$VENV/bin/activate"
+
 # 5. Self-test
 [ -n "${EXL3_NO_SELFTEST:-}" ] && { say "built; self-test skipped (EXL3_NO_SELFTEST). Run: $VENV/bin/python -m exllamav3.util.selftest"; exit 0; }
 say "self-test"

@@ -1,0 +1,5 @@
+# Test-suite extras on top of requirements.txt: pip install -r requirements_tests.txt
+pytest>=8
+pytest-xdist
+transformers>=4.50.0
+accelerate      # parity tests load the HF reference with a device / device_map

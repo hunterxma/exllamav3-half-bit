@@ -239,6 +239,8 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
+        if getattr(target, "loaded_tp", False):
+            raise NotImplementedError("DFlash2 drafting does not support tensor-parallel targets")
         if target.config.vocab_size != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
