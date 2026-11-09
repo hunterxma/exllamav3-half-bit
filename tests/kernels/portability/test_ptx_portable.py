@@ -8,6 +8,7 @@ reference of the PTX semantics instead.
 import hashlib
 import os
 import shutil
+import time
 
 import numpy as np
 import torch
@@ -95,6 +96,11 @@ def test_ptx_portable(device, tmp_path):
     header = os.path.join(EXT_DIR, "ptx_portable.cuh")
     with open(header, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
+    # torch waits forever on the lock of a build that was killed; no build of this kernel takes an hour
+    from torch.utils.cpp_extension import _get_build_directory
+    lock = os.path.join(_get_build_directory("ptx_portable_test", False), "lock")
+    if os.path.exists(lock) and time.time() - os.path.getmtime(lock) > 3600:
+        os.remove(lock)
     inc = EXT_DIR
     if HIP:
         shutil.copy(header, tmp_path)
