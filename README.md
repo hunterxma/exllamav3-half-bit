@@ -8,7 +8,7 @@ tags:
 
 # exllamav3 with half-step rates (4.5 to 7.5 bpw)
 
-This is a fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) (v1.6.6). It isn't affiliated with upstream.
+A fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) v1.6.6, not affiliated with upstream.
 It adds EXL3 trellis rates at half-bit steps (4.5, 5.5, 6.5 and 7.5 bpw) for dense and MoE layers, so a quant
 can mix in a 4.5- or 5.5-bit tensor instead of jumping a whole bit. Models built with these rates, such as
 [Qwen3.8-27B-EXL3-H500](https://huggingface.co/HydraAiM/Qwen3.8-27B-EXL3-H500), won't load on stock exllamav3.
@@ -22,7 +22,7 @@ cd exllamav3 && bash install.sh
 ```
 
 `install.sh` makes a venv in `./venv`, installs a matching PyTorch, builds the extension for your GPU only and runs
-a self-test. Then run things with `./venv/bin/python`.
+a self-test (10 to 30 minutes, mostly the build). Run scripts with `./venv/bin/python`.
 
 Tests: on an RTX 5060 Ti, 6,409 pass and one fails. The failure is an upstream statistical check in the conversion code
 (`test_out_scales.py::test_hessian_scales_move_the_error`, 0.70 against 0.63 ± 0.06), which this fork doesn't touch.
