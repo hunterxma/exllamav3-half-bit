@@ -88,6 +88,7 @@ say "venv: $VENV; installing $TORCH_SPEC ($IDX)"
 TCUDA=$("$VENV/bin/python" -c 'import torch; print(torch.version.cuda or "")')
 [ "${TCUDA%%.*}" = "${PICKV%%.*}" ] || die "PyTorch was built for CUDA $TCUDA but the toolkit is $PICKV (majors must match)"
 "${PIP[@]}" -q setuptools wheel ninja
+"${PIP[@]}" -q -r "$REPO/requirements_examples.txt"   # examples/chat.py and friends work straight after install
 
 # 4. Build for this GPU only. RAM bounds parallelism: each nvcc job can take ~3 GB
 CORES=$(nproc); RAM_GB=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)

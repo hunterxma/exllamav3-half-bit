@@ -1,3 +1,33 @@
+---
+license: mit
+library_name: exllamav3
+tags:
+  - exllamav3
+  - exl3
+---
+
+# exllamav3 with half-step rates (4.5 to 7.5 bpw)
+
+This is a fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) (v1.6.6). It isn't affiliated with upstream.
+It adds EXL3 trellis rates at half-bit steps (4.5, 5.5, 6.5 and 7.5 bpw) for dense and MoE layers, so a quant
+can mix in a 4.5- or 5.5-bit tensor instead of jumping a whole bit. Models built with these rates, such as
+[Qwen3.8-27B-EXL3-H500](https://huggingface.co/HydraAiM/Qwen3.8-27B-EXL3-H500), won't load on stock exllamav3.
+Integer-rate models load and run the same as upstream.
+
+Install on Linux with an NVIDIA GPU (compute 7.5 or newer), a driver and a CUDA toolkit:
+
+```bash
+git clone https://huggingface.co/HydraAiM/exllamav3-half-rates exllamav3
+cd exllamav3 && bash install.sh
+```
+
+`install.sh` makes a venv in `./venv`, installs a matching PyTorch, builds the extension for your GPU only and runs
+a self-test. Then run things with `./venv/bin/python`.
+
+Everything below this section is upstream's README.
+
+---
+
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
