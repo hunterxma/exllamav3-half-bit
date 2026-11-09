@@ -24,6 +24,9 @@ cd exllamav3 && bash install.sh
 `install.sh` makes a venv in `./venv`, installs a matching PyTorch, builds the extension for your GPU only and runs
 a self-test. Then run things with `./venv/bin/python`.
 
+Tests: on an RTX 5060 Ti, 6,409 pass and one fails. The failure is an upstream statistical check in the conversion code
+(`test_out_scales.py::test_hessian_scales_move_the_error`, 0.70 against 0.63 ± 0.06), which this fork doesn't touch.
+
 Everything below this section is upstream's README.
 
 ---
