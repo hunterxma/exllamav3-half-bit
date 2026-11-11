@@ -20,7 +20,6 @@ from exllamav3.modules.sliding_attn import SlidingAttention
 from exllamav3.modules.gated_delta_net import GatedDeltaNet
 from exllamav3.modules.quant.fp16 import LinearFP16
 from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k
-from datasets import load_dataset
 
 """
 Single-model quantization sensitivity measurement by weight-space noise injection.
@@ -101,12 +100,14 @@ class ModuleRunner:
                 mod.unload()
                 g_tensor_cache.drop_all()
 
-    def rows(self, mod, states, capture=None, consume=None, ids=None):
+    def rows(self, mod, states, capture=None, consume=None, ids=None, extra=None):
         """ids: the rows' token ids, passed as params["input_ids"] (PLE layers read the token
         context from there; without it they run on a dummy all-zero history)"""
         outputs = []
         for r, state in enumerate(states):
             params = {} if capture is None else {"capture": capture}
+            if extra:
+                params.update(extra)
             if ids is not None:
                 params["input_ids"] = ids[r]
             x = mod.prepare_for_device(state.clone(), params)
@@ -208,7 +209,7 @@ class Target:
         return sum(lin.weights_numel() for lin in self.linears)
 
 
-def collect_targets(mod):
+def collect_targets(mod, tiers=None):
     """Targets under one top-level module: the routed experts of each BlockSparseMLP as one
     grouped target (its routing gate and latent projections stay individual); the gate and up
     projections of each GatedMLP (dense MLPs and MoE shared experts alike) as one grouped target,
@@ -236,7 +237,17 @@ def collect_targets(mod):
             group(m, "qkv", qkv)
         elif isinstance(m, GatedDeltaNet):
             group(m, "qkvz", [getattr(m, "qkv_proj", None), getattr(m, "z_proj", None)])
-        if isinstance(m, BlockSparseMLP):
+        if isinstance(m, BlockSparseMLP) and tiers and m.key in tiers:
+            # Expert tiers (--expert_tiers): the layer's experts split by measured traffic, gate+up and down
+            # of each tier as separate targets, so every tier and projection gets its own bitrate
+            for j, tier in enumerate(tiers[m.key]):
+                for name, lins in (("gate_up", [m.gates[e] for e in tier] + [m.ups[e] for e in tier]),
+                                   ("down", [m.downs[e] for e in tier])):
+                    lins = [lin for lin in lins if lin is not None and lin.qmap is not None]
+                    if lins:
+                        targets.append(Target(f"{m.key}.experts.t{j}.{name}", lins, lins[0].qbits_key))
+                        grouped_ids.update(id(lin) for lin in lins)
+        elif isinstance(m, BlockSparseMLP):
             experts = [lin for lin in (m.gates + m.ups + m.downs) if lin is not None and lin.qmap is not None]
             if experts:
                 targets.append(Target(f"{m.key}.experts", experts, experts[0].qbits_key))
@@ -252,8 +263,28 @@ def collect_targets(mod):
     return targets
 
 
+def expert_tiers(route_stats, cuts):
+    """Experts of each MoE layer in tiers by routing-weight mass, hottest first: tier j holds the experts
+    that bring the cumulative mass up to cuts[j] (e.g. 0.5,0.85 -> hot / warm / cold). Experts never
+    routed on the trace fall in the coldest tier."""
+    tiers = {}
+    for key, st in route_stats.items():
+        w = torch.tensor(st["weight"], dtype = torch.float64)
+        order = torch.argsort(w, descending = True).tolist()
+        total = float(w.sum()) or 1.0
+        out, cur, acc, j = [[] for _ in range(len(cuts) + 1)], 0, 0.0, 0
+        for e in order:
+            while j < len(cuts) and acc >= cuts[j] * total:
+                j += 1
+            out[j].append(e)
+            acc += float(w[e])
+        tiers[key] = [sorted(t) for t in out if t]
+    return tiers
+
+
 @disk_lru_cache("get_dataset_text")
 def get_dataset_text(spec: dict):
+    from datasets import load_dataset   # only for the wikitext fallback (no --trace)
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     dataset_text = "\n\n".join(
         load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split = "test")
@@ -381,6 +412,8 @@ def main(args):
             del x
         return kld_sum / len(states), out_states
 
+    route_counts = {}
+
     @torch.inference_mode()
     def ref_pass():
         """Full reference pass, caching the input state to every module and the final logits"""
@@ -392,13 +425,13 @@ def main(args):
                 boundary[i] = states
                 with runner.loaded(i) as mod:
                     states = runner.rows(
-                        mod, states, ids = rows,
+                        mod, states, ids = rows, extra = {"route_counts": route_counts},
                         consume=(lambda r, x: logits.append(x.half().to("cpu", copy=True)))
                         if i == num_mods - 1 else None,
                     )
             return boundary, logits
         for ids_row in rows:
-            params = {"input_ids": ids_row}
+            params = {"input_ids": ids_row, "route_counts": route_counts}
             x = ids_row
             for i in range(num_mods):
                 mod = mods[i]
@@ -410,13 +443,25 @@ def main(args):
             logits.append(x.half().cpu())
         return boundary, logits
 
+    # Expert tiers need the layers' routing first: from a resumed output, else from the reference
+    # pass, which then runs here instead of below
+    tiers, route_stats, early_ref = None, None, None
+    if args.expert_tiers:
+        if args.out and os.path.exists(args.out):
+            route_stats = json.load(open(args.out)).get("route_stats")
+        if route_stats is None:
+            print(" -- Reference pass (routing statistics for expert tiers)")
+            early_ref = ref_pass()
+            route_stats = {k: dict(picks = n.tolist(), weight = w.tolist()) for k, (n, w) in route_counts.items()}
+        tiers = expert_tiers(route_stats, [float(c) for c in args.expert_tiers.split(",")])
+
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
-    # layer's routed experts as one grouped target
+    # layer's routed experts as one grouped target (or one per tier and projection)
     targets_by_idx = defaultdict(list)
     num_targets = 0
     num_grouped = 0
     for i in range(num_mods):
-        for t in collect_targets(mods[i]):
+        for t in collect_targets(mods[i], tiers):
             if not streaming:
                 for lin in t.linears:
                     assert isinstance(lin.inner, LinearFP16), \
@@ -480,6 +525,9 @@ def main(args):
                 rfn_ref = args.rfn_ref,
                 rfn_scale = args.rfn_scale if args.rfn_ref else None,
                 rfn = None if args.rfn_ref else args.rfn,
+                expert_tiers = args.expert_tiers,
+                route_stats = route_stats,
+                tiers = tiers,
                 results = results,
             )
             json.dump(output, f, indent = 2)
@@ -493,8 +541,11 @@ def main(args):
         return
 
     save()
-    print(" -- Reference pass")
-    boundary, ref_logits = ref_pass()
+    if early_ref is not None:
+        boundary, ref_logits = early_ref
+    else:
+        print(" -- Reference pass")
+        boundary, ref_logits = ref_pass()
 
     @torch.inference_mode()
     def perturb_iid(lin, rfn, seed):
@@ -914,4 +965,5 @@ if __name__ == "__main__":
     parser.add_argument("-dr", "--draws", type = int, default = 1, help = "Noise draws per level, default: 1")
     parser.add_argument("-t", "--top", type = int, default = 15, help = "Top contributors to print")
     parser.add_argument("-o", "--out", type = str, default = None, help = "Output file (JSON), resumes if present")
+    parser.add_argument("-et", "--expert_tiers", type = str, default = None, help = "Split each MoE layer's routed experts into traffic tiers at these cumulative routing-mass cuts (e.g. 0.5,0.85: hot/warm/cold), gate+up and down of each tier measured separately. Default: one target per layer")
     main(parser.parse_args())

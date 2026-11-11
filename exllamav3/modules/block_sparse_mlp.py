@@ -1081,6 +1081,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if params.get("activate_all_experts") and "capture_qmaps" in params:
                 selected_experts, routing_weights = \
                     self.capture_pass_experts(selected_experts, routing_weights, params["capture_qmaps"])
+            # Routing statistics (sc_measure --expert_tiers): picks and routing-weight mass per expert
+            route_counts = params.get("route_counts")
+            if route_counts is not None:
+                n, w = route_counts.setdefault(self.key, (torch.zeros(self.num_experts, dtype = torch.float64),
+                                                          torch.zeros(self.num_experts, dtype = torch.float64)))
+                sel = selected_experts.reshape(-1)
+                n += torch.bincount(sel, minlength = self.num_experts).double().cpu()
+                w += torch.bincount(sel, weights = routing_weights.reshape(-1).float(), minlength = self.num_experts).double().cpu()
         elif bsz == 1:
             # Stable broadcast targets rather than per-call allocations
             if self.bcast_sel_bsz1 is None:

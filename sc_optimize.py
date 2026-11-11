@@ -132,11 +132,40 @@ def main(args):
     if num_tied:
         print(f" -- Tied groups: {num_tied} ({args.tie})")
 
+    # Read fraction per tensor: the share of its weights read per decoded token. Dense tensors are
+    # read every token; a routed expert only when picked, so a group of experts (a layer, or one
+    # traffic tier of it) reads sum_e p_e numel_e / sum numel_e with p_e = picks_e / tokens from
+    # the measurement's routing statistics (sc_measure --expert_tiers)
+    route = meas.get("route_stats") or {}
+    def expert_p(member):
+        for mlp, st in route.items():
+            if member.startswith(mlp + "."):
+                idx = [int(x) for x in member[len(mlp) + 1:].split(".") if x.isdigit()]
+                picks = st["picks"]
+                tokens = sum(picks) / args.experts_per_token
+                return picks[idx[0]] / tokens if idx and tokens else None
+        return None
+    def read_frac(r):
+        mem = r.get("members", [r["key"]])
+        ps = [expert_p(m) for m in mem]
+        if any(p is None for p in ps):
+            return 1.0
+        return min(1.0, sum(ps) / len(ps))
+    for r in tensors:
+        r["read"] = read_frac(r)
+
     # Exact greedy: all groups start at min_k, spend budget one bit-per-weight increment at a
-    # time on the largest marginal KL reduction per storage bit
+    # time on the largest marginal KL reduction per storage bit (--speed_weight: per storage bit
+    # plus lambda x bits read per token, so bandwidth-heavy tensors pay for their decode time)
     sum_numel = sum(r["numel"] for r in tensors)
+    if args.budget_gb is not None:
+        budget = int((args.budget_gb - args.fixed_gb) * 8e9)
+        args.bitrate = budget / sum_numel
+        print(f" -- Budget {args.budget_gb} GB - {args.fixed_gb} GB fixed -> {args.bitrate:.4f} bpw over the budgeted weights")
     budget = int(args.bitrate * sum_numel)
     numel_g = [sum(r["numel"] for r in g) for g in groups]
+    lam = args.speed_weight
+    cost_g = [sum(r["numel"] * (1 + lam * r["read"]) for r in g) for g in groups]
     step = args.k_step
     k_group = [float(args.min_k) if step != 1 else int(args.min_k)] * len(groups)
     spent = args.min_k * sum_numel
@@ -149,7 +178,7 @@ def main(args):
     for i, g in enumerate(groups):
         if args.min_k < args.max_k:
             gain = kld_at_g(g, args.min_k) - kld_at_g(g, args.min_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, args.min_k + step))
+            heapq.heappush(heap, (-gain / cost_g[i], i, args.min_k + step))
     while heap:
         neg_density, i, next_k = heapq.heappop(heap)
         if spent + numel_g[i] * step > budget:
@@ -160,7 +189,7 @@ def main(args):
         spent += numel_g[i] * step
         if next_k < args.max_k - 1e-9:
             gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], next_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, next_k + step))
+            heapq.heappush(heap, (-gain / cost_g[i], i, next_k + step))
 
     # Exchange repair: a group (especially a tied pair, whose increments are twice the size) can
     # be stranded at a low K when its next increment stops fitting the remaining budget while
@@ -177,7 +206,7 @@ def main(args):
         for j, h in enumerate(groups):
             if k_group[j] > args.min_k + 1e-9:
                 loss = kld_at_g(h, k_group[j] - step) - kld_at_g(h, k_group[j])
-                cands.append((loss / (numel_g[j] * step), loss, numel_g[j] * step, j))
+                cands.append((loss / (cost_g[j] * step), loss, numel_g[j] * step, j))
         cands.sort()
         best = None  # (kld improvement, promote group, [demote groups])
         for i, g in enumerate(groups):
@@ -196,7 +225,12 @@ def main(args):
                 need -= nj
             if need > 0:
                 continue
+            # with a speed weight, a move must also not raise the read cost more than it lowers KLD
+            # per unit of the greedy's exchange rate; at lambda 0 this is the plain KLD test
             delta = gain - loss_sum
+            if lam:
+                d_read = cost_g[i] * step - sum(cost_g[j] * step for j in demote)
+                delta -= max(0.0, d_read) * (gain / (cost_g[i] * step))
             if delta > 0 and (best is None or delta > best[0]):
                 best = (delta, i, demote)
         if best is None:
@@ -233,7 +267,10 @@ def main(args):
             spent_b += r["numel"]
     pred_kld_base = sum(kld_at(r, k_base[r["key"]]) for r in tensors)
 
+    read_bytes = sum(r["read"] * r["numel"] * k_assign[r["key"]] / 8 for r in tensors)
     print(f" -- Budget: {budget:,} bits over {sum_numel:,} weights")
+    print(f" -- Budgeted weights: {spent / 8e9:.3f} GB; decode reads {read_bytes / 1e9:.3f} GB per token "
+          f"(routing-weighted, before head/embeddings; speed weight {lam})")
     print(f" -- Achieved bitrate:      {achieved_bpw:.4f} bpw (target {args.bitrate:.4f})")
     print(f" -- Predicted KLD:         {pred_kld:.6f}")
     print(f" -- Predicted KLD (ends-first baseline at same budget): {pred_kld_base:.6f}")
@@ -264,6 +301,9 @@ def main(args):
         target_bpw = args.bitrate,
         achieved_bpw = round(achieved_bpw, 4),
         predicted_kld = round(pred_kld, 6),
+        budgeted_gb = round(spent / 8e9, 4),
+        decode_read_gb = round(read_bytes / 1e9, 4),
+        speed_weight = lam,
         head_bits = args.head_bits,
         tie = args.tie,
         # A grouped target's bitrate applies to every member tensor (one K per MoE layer's experts)
@@ -314,7 +354,11 @@ def layer_of(key):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--measurement", type = str, required = True, help = "Sensitivity measurement JSON from sc_measure.py")
-    parser.add_argument("-b", "--bitrate", type = float, required = True, help = "Target mean bitrate over quantizable (non-head) weights")
+    parser.add_argument("-b", "--bitrate", type = float, default = None, help = "Target mean bitrate over quantizable (non-head) weights")
+    parser.add_argument("-gb", "--budget_gb", type = float, default = None, help = "Size budget in GB (1e9 bytes) for the whole quantized model instead of --bitrate; --fixed_gb is subtracted")
+    parser.add_argument("-fgb", "--fixed_gb", type = float, default = 0.0, help = "GB outside the budgeted weights (head, norms, router, MTP, state the budget must also hold)")
+    parser.add_argument("-sw", "--speed_weight", type = float, default = 0.0, help = "Lambda: each bit costs its storage plus lambda x its expected reads per decoded token (routing-weighted); 0 = size only")
+    parser.add_argument("-ept", "--experts_per_token", type = int, default = 8, help = "Routed experts per token, for read fractions")
     parser.add_argument("-hb", "--head_bits", type = int, default = 6, help = "Head bitrate, default: 6")
     parser.add_argument("-rr", "--rfn_ref", type = str, default = None, help = "Per-tensor quantization error anchors (rfn probe JSON)")
     parser.add_argument("-a", "--anchor", type = str, default = "2:0.292", help = "Global error anchor K:rfn if no --rfn_ref, default: 2:0.292")
