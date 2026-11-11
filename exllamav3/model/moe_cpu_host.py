@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import time
 import multiprocessing
 from multiprocessing import shared_memory
@@ -1053,7 +1054,16 @@ class MoeCpuHost:
                     self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS),
             daemon = True,
         )
-        self.proc.start()
+        # The child target lives in this package, so it never needs the parent's __main__. Hide the
+        # main script's path while starting: otherwise spawn re-runs an unguarded script (no
+        # `if __name__ == "__main__"`) in the child, which loads the model again and dies there
+        main = sys.modules.get("__main__")
+        main_file = main.__dict__.pop("__file__", None) if main is not None and getattr(main, "__spec__", None) is None else None
+        try:
+            self.proc.start()
+        finally:
+            if main_file is not None:
+                main.__file__ = main_file
         child_conn.close()
         # Parent -> child messages go through a queue and a sender thread: a layer spec is tens
         # of KB, and a direct send would block the loading thread until the child's receiver
