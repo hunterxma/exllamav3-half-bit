@@ -455,6 +455,9 @@ def main(args):
             route_stats = {k: dict(picks = n.tolist(), weight = w.tolist()) for k, (n, w) in route_counts.items()}
         tiers = expert_tiers(route_stats, [float(c) for c in args.expert_tiers.split(",")])
 
+    import re
+    target_filter = re.compile(args.targets) if args.targets else None
+
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
     # layer's routed experts as one grouped target (or one per tier and projection)
     targets_by_idx = defaultdict(list)
@@ -462,6 +465,8 @@ def main(args):
     num_grouped = 0
     for i in range(num_mods):
         for t in collect_targets(mods[i], tiers):
+            if target_filter is not None and not target_filter.search(t.key):
+                continue
             if not streaming:
                 for lin in t.linears:
                     assert isinstance(lin.inner, LinearFP16), \
@@ -965,5 +970,6 @@ if __name__ == "__main__":
     parser.add_argument("-dr", "--draws", type = int, default = 1, help = "Noise draws per level, default: 1")
     parser.add_argument("-t", "--top", type = int, default = 15, help = "Top contributors to print")
     parser.add_argument("-o", "--out", type = str, default = None, help = "Output file (JSON), resumes if present")
+    parser.add_argument("--targets", type = str, default = None, help = "Only measure targets whose key matches this regex (e.g. a long-context pass over the attention and GDN projections only)")
     parser.add_argument("-et", "--expert_tiers", type = str, default = None, help = "Split each MoE layer's routed experts into traffic tiers at these cumulative routing-mass cuts (e.g. 0.5,0.85: hot/warm/cold), gate+up and down of each tier measured separately. Default: one target per layer")
     main(parser.parse_args())
