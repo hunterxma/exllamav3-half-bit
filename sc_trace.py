@@ -11,7 +11,6 @@ from safetensors.torch import save_file
 from exllamav3 import Generator, Job, model_init, Config, Tokenizer
 from exllamav3.util.progress import ProgressBar
 from eval.qbench_prompts import clean_response_for_context, DEFAULT_TEMPLATE_VARS
-from eval.api_source import ApiChat, resolve_api_key, assistant_message, response_token_ids
 
 """
 Generate a large self-sampled, in-domain trace, sized for use as quantization calibration data:
@@ -635,6 +634,8 @@ def run_api_wave(api, args, tokenizer, convs, pending, template_vars, t_idx, pro
 def main(args):
     api = None
     if args.api_model:
+        global assistant_message, response_token_ids
+        from eval.api_source import ApiChat, resolve_api_key, assistant_message, response_token_ids
         # Responses from the API; the local model is only its tokenizer and chat template
         config = Config.from_directory(args.model_dir)
         tokenizer = Tokenizer.from_config(config)
@@ -690,6 +691,15 @@ def main(args):
         effort = TEMPLATE_VARS.get("reasoning_effort")
         api.extra["reasoning"] = {"effort": effort} if effort in ("low", "medium", "high") else {"enabled": True}
 
+    prefix_ids, prefix_src = [], []
+    if args.prompts:
+        with open(args.prompts) as f:
+            for line in f:
+                r = json.loads(line)
+                prefix_ids.append(tokenizer.encode(r["prefix"], encode_special_tokens = True, add_bos = False))
+                prefix_src.append(r.get("source"))
+        print(f" -- {len(prefix_ids)} prompt prefixes from {args.prompts}")
+
     target_tokens = args.target_tokens or args.cal_rows * args.cal_cols
     rows = []
     total_in = total_out = 0
@@ -702,7 +712,10 @@ def main(args):
             if total_packed() >= target_tokens:
                 break
             convs = [{"messages": [], "turns": [seed] + fu, "alive": True}
-                     for seed, fu in CONVERSATIONS]
+                     for seed, fu in (CONVERSATIONS if args.builtin else [])]
+            # --prompts: pre-templated conversation prefixes (ending in the generation prompt), one turn each
+            convs += [{"messages": [], "turns": [None], "alive": True, "prefix_ids": ids, "source": src}
+                      for ids, src in zip(prefix_ids, prefix_src)]
             max_turns = max(len(c["turns"]) for c in convs)
 
             # Turn-major waves: every conversation's turn t runs as one concurrent batch, so a
@@ -715,9 +728,14 @@ def main(args):
                 for c_idx, conv in enumerate(convs):
                     if not conv["alive"] or t_idx >= len(conv["turns"]):
                         continue
-                    conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
-                    input_ids = tokenizer.hf_chat_template(
-                        conv["messages"], add_generation_prompt = True, **TEMPLATE_VARS)
+                    if "prefix_ids" in conv:
+                        if api is not None:
+                            continue
+                        input_ids = conv["prefix_ids"]
+                    else:
+                        conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
+                        input_ids = tokenizer.hf_chat_template(
+                            conv["messages"], add_generation_prompt = True, **TEMPLATE_VARS)
                     seed = zlib.crc32(f"{args.seed}|{epoch}|{c_idx}|{t_idx}".encode())
                     pending[c_idx] = {"input_ids": input_ids, "chunks": [], "eos_reason": None, "seed": seed}
                     if api is None:
@@ -759,7 +777,8 @@ def main(args):
                     response_ids = torch.cat(chunks, dim = -1)[0] if chunks \
                         else torch.empty(0, dtype = torch.long)
                     if response_ids.numel() == 0:
-                        conv["messages"].pop()
+                        if "prefix_ids" not in conv:
+                            conv["messages"].pop()
                         conv["alive"] = False
                         continue
                     if "assistant" in p:
@@ -771,6 +790,15 @@ def main(args):
                         total_in += p["input_ids"].shape[-1]
                         total_out += response_ids.numel()
                         conv["messages"].append({"role": "assistant", "content": p["assistant"]["content"]})
+                        continue
+                    if "prefix_ids" in conv:
+                        rows.append({
+                            "conversation": c_idx, "turn": t_idx, "epoch": epoch, "eos_reason": p["eos_reason"],
+                            "input_ids": p["input_ids"][0].tolist(), "response_ids": response_ids.tolist(),
+                            "source": conv["source"],
+                        })
+                        total_in += p["input_ids"].shape[-1]
+                        total_out += response_ids.numel()
                         continue
                     rows.append({
                         "conversation": c_idx,
@@ -845,6 +873,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 3072, help = "Per-turn generation cap, default: 3072")
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
+    parser.add_argument("--prompts", type = str, default = None, help = "JSONL of {\"prefix\": templated conversation prefix ending in the generation prompt, \"source\"}: one sampled turn each (in-domain calibration from real conversations, tool results included)")
+    parser.add_argument("--no_builtin", dest = "builtin", action = "store_false", help = "Skip the built-in seed conversations (use only --prompts)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
     parser.add_argument("--api_model", type = str, default = None, help = "Source the responses from an OpenAI-compatible chat API instead of the local model (model name or OpenRouter slug); -m then provides the tokenizer and chat template")
     parser.add_argument("--api_base", type = str, default = "https://openrouter.ai/api/v1", help = "Chat API base URL, default: OpenRouter")
