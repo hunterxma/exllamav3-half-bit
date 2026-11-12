@@ -41,7 +41,11 @@ void quantize_tiles_frac_reg_kernel
     const half2* __restrict__ lut
 )
 {
-    static_assert(KA >= 2 && KA <= 7, "cost rows in shared memory (KA >= 2), lane groups within a warp (KA <= 9)");
+    // MASK = 0: every step KA bits, i.e. the integer-rate trellis of the dense quantize_tiles kernels (same windows,
+    // edges and tie-breaking; verified bit-identical), so the integer path can use this kernel (quantize.cu,
+    // EXL3_INT_REG). The step dispatch stays a runtime switch for every MASK: an `if constexpr (MASK == 0)` shortcut
+    // to the single step type miscompiled (nvcc 13.1) into a wrong search
+    static_assert(KA >= 2 && KA <= (MASK ? 7 : 8), "cost rows in shared memory (KA >= 2), at most 8-bit steps");
     static_assert(L % 32 == 0, "the 16-position pattern must tile both halves of the ring");
     static_assert(NT == 512 || NT == 1024);
     constexpr int NW = NT / 32;
@@ -142,7 +146,7 @@ void quantize_tiles_frac_reg_kernel
             if (write_hist)
             {
                 // k = window >> (16 - KOUT) = in_edge >> (16 - KOUT - KIN)
-                constexpr int ks = 16 - KOUT - KIN;
+                constexpr int ks = 16 - KOUT - KIN > 0 ? 16 - KOUT - KIN : 0;   // (> 0 except in unused KA = 8 variants)
                 reinterpret_cast<uint16_t*>(hist_row)[out_edge >> 1] =
                     (uint16_t) ((((best0 & 0xffffu) >> ks) & 0xffu) | ((((best1 & 0xffffu) >> ks) & 0xffu) << 8));
             }

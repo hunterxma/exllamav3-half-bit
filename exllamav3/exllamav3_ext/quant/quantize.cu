@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <map>
 #include <cstdlib>
+#include <cstring>
 #include "../util.h"
 #include "../util.cuh"
 #include "codebook.cuh"
@@ -233,14 +234,41 @@ void quantize_tiles
         TORCH_CHECK_SIZE(temp_edges, 2, edges);
         scratch_tiles = MIN(temp_costs.size(0), temp_edges.size(0));
     }
-    const int max_batch_size = (int) MIN(scratch_tiles, (int64_t) blocks_per_sm * DevCtx::instance().get_num_sms(device));
+    // Register-resident trellis (quantize_tiles_frac_reg_kernel.cuh, all-KA step pattern) for the mul1 codebook: the
+    // same search and result as the dense kernels, in their byte history layout. EXL3_INT_REG=1 (all K) or a list of
+    // K ("3,4,7,8"); EXL3_INT_REG_NT=512|1024 (default 512)
+    fp_quantize_tiles_kernel run_kernel = kernel;
+    int run_threads = num_threads, run_shmem = shmem, run_bps = blocks_per_sm;
+    {
+        const char* env = getenv("EXL3_INT_REG");
+        bool use = env && env[0] && env[0] != '0';
+        if (use && strcmp(env, "1") != 0) { char needle[4]; snprintf(needle, sizeof(needle), "%d", K); use = strstr(env, needle) != nullptr; }
+        if (use && optimized && cb == 2 && L == 256 && K >= 2 && K <= 8)
+        {
+            const char* env_nt = getenv("EXL3_INT_REG_NT");
+            const int nt = env_nt && atoi(env_nt) == 1024 ? 1024 : 512;
+            typedef fp_quantize_tiles_kernel (*fn_t)();
+            const fn_t t512[9] = {nullptr, nullptr, &quantize_tiles_frac_reg_kernel_a2_m0_t512, &quantize_tiles_frac_reg_kernel_a3_m0_t512,
+                &quantize_tiles_frac_reg_kernel_a4_m0_t512, &quantize_tiles_frac_reg_kernel_a5_m0_t512, &quantize_tiles_frac_reg_kernel_a6_m0_t512,
+                &quantize_tiles_frac_reg_kernel_a7_m0_t512, &quantize_tiles_frac_reg_kernel_a8_m0_t512};
+            const fn_t t1024[9] = {nullptr, nullptr, &quantize_tiles_frac_reg_kernel_a2_m0_t1024, &quantize_tiles_frac_reg_kernel_a3_m0_t1024,
+                &quantize_tiles_frac_reg_kernel_a4_m0_t1024, &quantize_tiles_frac_reg_kernel_a5_m0_t1024, &quantize_tiles_frac_reg_kernel_a6_m0_t1024,
+                &quantize_tiles_frac_reg_kernel_a7_m0_t1024, &quantize_tiles_frac_reg_kernel_a8_m0_t1024};
+            run_kernel = (nt == 1024 ? t1024 : t512)[K]();
+            run_threads = nt;
+            run_shmem = L * sizeof(half) + 32 * sizeof(int) + 2 * edges * (int) sizeof(half);
+            cuda_check(cudaFuncSetAttribute(run_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, run_shmem));
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&run_bps, run_kernel, run_threads, run_shmem));
+        }
+    }
+    const int max_batch_size = (int) MIN(scratch_tiles, (int64_t) run_bps * DevCtx::instance().get_num_sms(device));
     TORCH_CHECK(max_batch_size > 0, "quantize_tiles scratch must hold at least one tile");
-    const half2* lut = optimized && K == 6 ? quantize_codebook(device, cb, input_tiles) : nullptr;
+    const half2* lut = optimized && K == 6 && run_kernel == kernel ? quantize_codebook(device, cb, input_tiles) : nullptr;
 
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);
-        kernel<<<bsz, num_threads, shmem, stream>>>
+        run_kernel<<<bsz, run_threads, run_shmem, stream>>>
         (
             ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
             ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,

@@ -51,6 +51,21 @@ fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a5_maaaa();
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a6_maaaa();
 fp_quantize_tiles_kernel quantize_tiles_frac_kernel_a7_maaaa();
 // Register-resident variants (quantize_tiles_frac_reg_kernel.cuh): same result, 512 or 1024 threads
+// MASK 0 = integer rates K = 2..8 (EXL3_INT_REG in quantize_tiles)
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a2_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a2_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a3_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a3_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a4_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a4_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a5_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a5_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a6_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a6_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a7_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a7_m0_t1024();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a8_m0_t512();
+fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a8_m0_t1024();
 fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a2_maaaa_t512();
 fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a2_maaaa_t1024();
 fp_quantize_tiles_kernel quantize_tiles_frac_reg_kernel_a3_maaaa_t512();
