@@ -88,6 +88,11 @@ _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
 # over the picked set exactly as a model without those experts would
 _expert_mask_cache = None
 
+# Calibration capture with every expert active: batch the expert GEMMs in chunks of experts (EXL3_CAPTURE_BATCHED=0
+# keeps the per-expert loop); a chunk holds about EXL3_CAPTURE_CHUNK_ROWS rows of all its experts (memory bound)
+_capture_batched = os.environ.get("EXL3_CAPTURE_BATCHED", "1") != "0"
+_capture_chunk_rows = int(os.environ.get("EXL3_CAPTURE_CHUNK_ROWS", 131072))
+
 def _expert_mask() -> dict:
     global _expert_mask_cache
     if _expert_mask_cache is None:
@@ -1714,6 +1719,69 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return final_hidden_states
 
 
+    def _capture_batch_ok(self, experts, x):
+        """The batched all-experts capture applies when every expert projection is a plain fp16 (in, out) matmul
+        (calibration loads them unquantized): no bias, LoRA, scales, softcap, padding or pinned host storage"""
+        if not _capture_batched or self.interm_dtype != torch.half or self.activation_fn_call is None:
+            return False
+        from .quant.fp16 import LinearFP16
+        I = self.gates[experts[0]].out_features
+        for e in experts:
+            for lin in (self.gates[e], self.ups[e], self.downs[e]):
+                inner = lin.inner
+                if not isinstance(inner, LinearFP16) or inner.bias is not None or inner._pinned_store is not None or \
+                        lin.lora_a_tensors or lin.pre_scale != 1.0 or lin.post_scale != 1.0 or lin.softcap != 0.0:
+                    return False
+            if self.gates[e].in_features != x.shape[-1] or self.ups[e].in_features != x.shape[-1] or \
+                    self.gates[e].out_features != I or self.ups[e].out_features != I or self.downs[e].in_features != I:
+                return False
+        return True
+
+
+    def _capture_all_experts_batched(self, x, experts, sens_weights, aff_w, params):
+        """
+        _capture_all_experts with the expert GEMMs, activations and output-sensitivity slopes batched over chunks of
+        experts (stacked fp16 weights, one matmul per projection per chunk) instead of ~15 launches per expert. The
+        captures themselves are the per-expert calls of the loop (gate/up input bookkeeping, down Hessians with
+        their row weights), in the same order, so only the GEMM accumulation order can differ.
+        """
+        from .mlp import capture_out_sensitivity_batched
+        pass_qmaps = params.get("capture_qmaps")
+        T, I = x.shape[0], self.gates[experts[0]].out_features
+        # gate/up input: the capture each expert's Linear.forward performs (one accumulation, bookkeeping for the rest)
+        if "capture" in params:
+            for e in experts:
+                for lin in (self.ups[e], self.gates[e]):
+                    if lin.qmap and (pass_qmaps is None or lin.qmap in pass_qmaps):
+                        lin.capture_H(x, params)
+        chunk = max(1, min(len(experts), _capture_chunk_rows // max(T, 1)))
+        for c0 in range(0, len(experts), chunk):
+            ce = experts[c0 : c0 + chunk]
+            wu = torch.stack([self.ups[e].inner.weight for e in ce])
+            wg = torch.stack([self.gates[e].inner.weight for e in ce])
+            u = torch.matmul(x, wu)                       # (C, T, I)
+            g = torch.matmul(x, wg)
+            del wu, wg
+            if sens_weights is not None:
+                sw = sens_weights[:, ce].T                # (C, T)
+                capture_out_sensitivity_batched(
+                    params["capture_sens"], [self.gates[e] for e in ce], [self.ups[e] for e in ce],
+                    [self.downs[e] for e in ce], g, u, self.activation_fn, self.act_limit, sw
+                )
+            self.activation_fn_call(g.view(-1, I), u.view(-1, I), u.view(-1, I), self.act_limit)   # a overwrites u
+            del g
+            for i, e in enumerate(ce):
+                down = self.downs[e]
+                if down.qmap and (pass_qmaps is None or down.qmap in pass_qmaps):
+                    if aff_w is not None:
+                        params["capture_row_w"] = aff_w[:, e]
+                    try:
+                        down.capture_H(u[i], params)
+                    finally:
+                        params.pop("capture_row_w", None)
+            del u
+
+
     def _capture_all_experts(self, y, selected_experts, sens_weights, aff_w, params):
         """
         Calibration capture with every expert active when the routed output is not needed: for
@@ -1724,7 +1792,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         the down matmul, the routing weighting and the scatter-add.
         """
         x = y if y.dtype == torch.half else y.half()
-        for e in selected_experts[0].tolist():
+        experts = selected_experts[0].tolist()
+        x2 = x.view(-1, x.shape[-1])
+        if self._capture_batch_ok(experts, x2):
+            return self._capture_all_experts_batched(x2, experts, sens_weights, aff_w, params)
+        for e in experts:
             u = self.ups[e].forward(x, params)
             g = self.gates[e].forward(x, params)
             if sens_weights is not None:

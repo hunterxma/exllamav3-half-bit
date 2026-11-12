@@ -120,6 +120,46 @@ def capture_out_sensitivity(
         acc["count"] = acc["count"] + rows
 
 
+def capture_out_sensitivity_batched(
+    capture: dict,
+    gates: list,
+    ups: list,
+    downs: list,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    activation_fn: str,
+    act_limit: float,
+    weights: torch.Tensor,
+):
+    """
+    capture_out_sensitivity for C experts at once: g, u (C, T, n), weights (C, T) routing weights (0 = not routed).
+    The slopes are elementwise, so one call over all C x T rows gives each expert's rows exactly; per expert the sum
+    of squares over its rows and the routed-row count go into its accumulators, as C separate calls would.
+    """
+    C, T, n = g.shape
+    slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+    if slopes is None:
+        return
+    wv = weights.float().reshape(-1, 1)
+    rows = (weights != 0).sum(dim = 1)
+    for lins, c in zip((ups, gates), slopes):
+        c = torch.nan_to_num(c * wv, nan = 0.0, posinf = 0.0, neginf = 0.0)
+        sq = c.double().square().view(C, T, n).sum(dim = 1)       # (C, n)
+        for i, linear in enumerate(lins):
+            if linear is None or linear.qmap is None:
+                continue
+            acc = capture.get(linear.key)
+            if acc is None:
+                dn = downs[i].inner.get_weight_tensor()[:n].float().square().sum(dim = 1).double()
+                acc = capture[linear.key] = {
+                    "sum": torch.zeros(n, dtype = torch.double, device = g.device),
+                    "count": 0,
+                    "down": dn.to(g.device),
+                }
+            acc["sum"] += sq[i]
+            acc["count"] = acc["count"] + rows[i]
+
+
 def merge_out_sensitivity(capture: dict, other: dict):
     """Fold the accumulators of another device's calibration shard into capture"""
     for key, acc in other.items():
