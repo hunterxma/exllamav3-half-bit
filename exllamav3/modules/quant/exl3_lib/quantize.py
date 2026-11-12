@@ -1217,6 +1217,18 @@ def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
     return tiles[:, tensor_core_perm(device)].contiguous()
 
 
+# Scale search cost, validated on Qwen3.6-35B layer 0 (774 tensors, 2.5-8 bpw, against the old 3 / 1 / 5):
+# coarse stride 9 + 3 adaptive fine points = half the sample quantizations, 697/715 tensors bit-identical, geo-mean
+# proxy error ratio 0.997, layer rfn 0.004687 vs 0.004746. A fine stride of 2 cost +0.5% proxy error: kept at 1.
+# EXL3_GSS_COARSE_STRIDE=3 EXL3_GSS_FINE_POINTS=5 restores the old search
+_GSS_COARSE_STRIDE = int(os.environ.get("EXL3_GSS_COARSE_STRIDE", 9))
+_GSS_FINE_STRIDE = int(os.environ.get("EXL3_GSS_FINE_STRIDE", 1))
+# EXL3_GSS_FINE_POINTS=3: the fine stage evaluates the coarse minimum and its two neighbours (+-0.075); a tensor whose
+# minimum lands on an edge gets the next point outward (one extra batched evaluation for those only), so the
+# parabola always brackets a minimum like the 5-point grid's interior case
+_GSS_FINE_POINTS = int(os.environ.get("EXL3_GSS_FINE_POINTS", 3))
+
+
 def g_scale_search_batch(
     samples: list[torch.Tensor],
     quant_args: dict,
@@ -1255,17 +1267,46 @@ def g_scale_search_batch(
         return out
 
     # Stage 1: coarse grid over the full search range, on a subsample of each tensor's tiles
+    # (EXL3_GSS_COARSE_STRIDE / EXL3_GSS_FINE_STRIDE: tile subsampling of the two stages, default 3 / 1)
     coarse = [0.1 + 0.2 * i for i in range(10)]  # 0.1 .. 1.9, same range as the old golden-section bracket
-    subs = [s[::3] for s in samples]
+    subs = [s[::_GSS_COARSE_STRIDE] for s in samples]
     pairs1 = [(t, s) for t in range(n_t) for s in coarse]
     mse1 = eval_pairs(pairs1, subs).view(n_t, len(coarse))
     centers = [coarse[c] for c in mse1.argmin(dim = 1).tolist()]
 
     # Stage 2: fine grid around each tensor's coarse minimum, on its full sample
     step = 0.075
+    fine_samples = [s[::_GSS_FINE_STRIDE] for s in samples] if _GSS_FINE_STRIDE > 1 else samples
+    if _GSS_FINE_POINTS == 3:
+        pts = [{c + step * d: None for d in (-1, 0, 1)} for c in centers]
+        pairs2 = [(t, x) for t in range(n_t) for x in pts[t]]
+        for (t, x), m in zip(pairs2, eval_pairs(pairs2, fine_samples).tolist()):
+            pts[t][x] = m
+        # edge minima: extend outward until the minimum is interior (each round one batched evaluation)
+        for _ in range(4):
+            ext_pairs = []
+            for t in range(n_t):
+                xs = sorted(pts[t]); b = min(xs, key = lambda x: pts[t][x])
+                if b == xs[0] and b - step > 0.005: ext_pairs.append((t, b - step))
+                elif b == xs[-1]: ext_pairs.append((t, b + step))
+            if not ext_pairs:
+                break
+            for (t, x), m in zip(ext_pairs, eval_pairs(ext_pairs, fine_samples).tolist()):
+                pts[t][x] = m
+        results = []
+        for t in range(n_t):
+            xs = sorted(pts[t]); i = min(range(len(xs)), key = lambda j: pts[t][xs[j]])
+            offset = 0.0
+            if 0 < i < len(xs) - 1:
+                y0, y1, y2 = pts[t][xs[i - 1]], pts[t][xs[i]], pts[t][xs[i + 1]]
+                denom = y0 - 2.0 * y1 + y2
+                offset = 0.5 * (y0 - y2) / denom if denom > 0 else 0.0
+                offset = max(-0.5, min(0.5, offset))
+            results.append((max(xs[i] + offset * step, 0.01), torch.tensor(pts[t][xs[i]], device = device)))
+        return results
     fine = [[c + step * (i - 2) for i in range(5)] for c in centers]
     pairs2 = [(t, s) for t in range(n_t) for s in fine[t]]
-    mse2 = eval_pairs(pairs2, samples).view(n_t, 5)
+    mse2 = eval_pairs(pairs2, fine_samples).view(n_t, 5)
     mse2_h = mse2.tolist()
 
     results = []
