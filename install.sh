@@ -194,9 +194,11 @@ for comp in ("cuda_nvcc", "cuda_cccl"):
         top = t.getnames()[0].split("/")[0]
         for m in t.getmembers():
             m.name = m.name[len(top) + 1:] if m.name.startswith(top + "/") else ""
-            if m.name:
-                try: t.extract(m, out, filter="tar")
-                except TypeError: t.extract(m, out)   # Python without extraction filters (< 3.10.12 / 3.11.4)
+            if not m.name: continue
+            try: t.extract(m, out, filter="tar")
+            except TypeError: t.extract(m, out)   # Python without extraction filters (< 3.10.12 / 3.11.4)
+            # as root in a user namespace (rootless containers) tarfile's chown fails and it then skips chmod
+            if m.isfile() or m.isdir(): (out / m.name).chmod(m.mode & 0o755 | (0o700 if m.isdir() else 0o600))
     tmp.unlink()
 PY
     cp -rf "$TK/cuda_nvcc/bin/." "$CUDA_HOME/bin/"
