@@ -673,8 +673,17 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
+// Blocks per SM the register allocation must allow. Unbounded, the 5+ bpw instances take 91-114 registers, so only
+// one 512-thread block fits an SM and the grid (256 gate/up blocks at bsz 1) runs in twice the waves of 2-4 bpw.
+// Bounded to 2 blocks (64 registers) the mul1 instances up to 6 bpw (and 5.5) spill nothing in the GEMV loop (a few
+// bytes in the epilogue); 6.5+ spill heavily and keep the compiler's choice. MOE_COOP_MINB=1 restores the old bound
+#ifndef MOE_COOP_MINB
+#define MOE_COOP_MINB 2
+#endif
+template <int bits, bool HALF>
+constexpr int coop_minb() { return (bits <= 5 || (bits == 6 && !HALF)) ? MOE_COOP_MINB : 1; }
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, coop_minb<bits, HALF>())
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
@@ -810,7 +819,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // expert and stores the trimmed row
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, coop_minb<bits, HALF>())
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
