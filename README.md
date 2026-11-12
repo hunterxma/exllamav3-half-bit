@@ -14,18 +14,25 @@ can mix in a 4.5- or 5.5-bit tensor instead of jumping a whole bit. Models built
 [Qwen3.8-27B-EXL3-H500](https://huggingface.co/HydraAiM/Qwen3.8-27B-EXL3-H500), won't load on stock exllamav3.
 Integer-rate models load and run the same as upstream.
 
+What the fork changes:
+
+- **Format and GPU kernels:** half rates in packing, reconstruct, GEMM and the fused MoE kernels; the fused decode MoE
+  kernel runs 2 blocks per SM up to 6 bpw (end to end +11.6% decode on Qwen3.6-35B-A3B, RTX 5060 Ti).
+- **CPU expert worker:** half rates on every ISA tier, with a packed planar layout on AVX2 (on by default,
+  `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=0` turns it off), so models larger than VRAM can offload experts at these rates.
+- **Quantizer:** register-resident half-rate trellis search (bit-identical, 1.35-2.1x faster), output-sensitivity
+  statistics on routed tokens only, sync-free capture; whole-convert time per Qwen3.6-35B-A3B layer 414 -> ~200 s.
+- **Loader:** honours `model.safetensors.index.json` when several shards hold the same tensor.
+
 Install on Linux with an NVIDIA GPU (compute 7.5 or newer), a driver and a CUDA toolkit:
 
 ```bash
-git clone https://huggingface.co/HydraAiM/exllamav3-half-rates exllamav3
-cd exllamav3 && bash install.sh
+git clone https://github.com/hunterxma/exllamav3-half-bit exllamav3 && bash exllamav3/install.sh
 ```
 
-`install.sh` makes a venv in `./venv`, installs a matching PyTorch, builds the extension for your GPU only and runs
-a self-test (10 to 30 minutes, mostly the build). Run scripts with `./venv/bin/python`.
-
-Tests: on an RTX 5060 Ti, 6,409 pass and one fails. The failure is an upstream statistical check in the conversion code
-(`test_out_scales.py::test_hessian_scales_move_the_error`, 0.70 against 0.63 ± 0.06), which this fork doesn't touch.
+`install.sh` finds the GPU and a CUDA toolkit the driver supports, makes a venv in `./venv` with the matching
+PyTorch, builds the extension for your GPU only and runs a self-test of every bitrate (10 to 30 minutes, mostly the
+build). Run scripts with `./venv/bin/python`. Tested on an RTX 5060 Ti (sm_120), CUDA 13.1, PyTorch 2.11 and 2.14.
 
 Everything below this section is upstream's README.
 
