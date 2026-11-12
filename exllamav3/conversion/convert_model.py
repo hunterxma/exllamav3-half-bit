@@ -1689,6 +1689,12 @@ def main(args, job_state):
                             del m._cap_bases
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
                     # EXL3_EXIT_AFTER_CAPTURE=<module idx>: a capture-only timing slice (tests); stop here
+                    if os.environ.get("EXL3_EXIT_AFTER_CAPTURE", "") == str(idx) and os.environ.get("EXL3_DUMP_CAPTURE"):
+                        # capture-only tests: the output-sensitivity accumulators and the Hessians' traces, to compare
+                        torch.save({
+                            "sens": {k: (v["sum"].cpu(), int(v["count"])) for k, v in capture_sens.items()},
+                            "H": {k: (v["H"].double().sum().item(), int(v["count"])) for k, v in capture_H.items()},
+                        }, os.environ["EXL3_DUMP_CAPTURE"])
                     if os.environ.get("EXL3_EXIT_AFTER_CAPTURE", "") == str(idx):
                         print(f" -- Phases: load {time.time() - start_module_time - (time.time() - t_phase):.1f} s  "
                               f"capture {time.time() - t_phase:.1f} s", flush = True)

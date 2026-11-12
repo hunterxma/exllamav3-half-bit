@@ -1752,7 +1752,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         captures themselves are the per-expert calls of the loop (gate/up input bookkeeping, down Hessians with
         their row weights), in the same order, so only the GEMM accumulation order can differ.
         """
-        from .mlp import capture_out_sensitivity_batched
+        from .mlp import capture_out_sensitivity_batched, capture_out_sensitivity_routed
         pass_qmaps = params.get("capture_qmaps")
         T, I = x.shape[0], self.gates[experts[0]].out_features
         # gate/up input: the capture each expert's Linear.forward performs (one accumulation, bookkeeping for the rest)
@@ -1769,6 +1769,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if _capture_h_batched and "capture" in params and all(
                 self.downs[e].qmap and (pass_qmaps is None or self.downs[e].qmap in pass_qmaps) for e in experts):
             hbase = self._capture_H_base([self.downs[e] for e in experts], I, aff_w is not None, params, x.device)
+        # Output-sensitivity slopes on the routed (expert, row) pairs only, all chunks at once: the chunks fill one
+        # gather buffer of at most T x top-k pairs (fixed-size nonzero over the expert-major routing weights, no host
+        # sync), evaluated after the loop (capture_out_sensitivity_routed). EXL3_SENS_ALL_ROWS=1: every row, per chunk
+        sens = None
+        if sens_weights is not None and not _sens_all_rows:
+            E_ = len(experts)
+            flat = sens_weights[:, experts].T.reshape(-1)                 # (E_ * T), expert-major in experts order
+            S = T * min(E_, self.num_experts_per_tok)
+            idx = torch.nonzero_static(flat != 0, size = S, fill_value = E_ * T).flatten()
+            valid = idx < E_ * T
+            idx = idx.clamp(max = E_ * T - 1)
+            pos = torch.div(idx, T, rounding_mode = "floor")
+            sens = dict(pos = pos, tok = idx - pos * T, wv = flat.index_select(0, idx).float() * valid,
+                        rows = (sens_weights[:, experts] != 0).sum(dim = 0),
+                        g = torch.zeros((S, I), dtype = torch.half, device = x.device),
+                        u = torch.zeros((S, I), dtype = torch.half, device = x.device))
         for c0 in range(0, len(experts), chunk):
             ce = experts[c0 : c0 + chunk]
             wu = torch.stack([self.ups[e].inner.weight for e in ce])
@@ -1776,13 +1792,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             u = torch.matmul(x, wu)                       # (C, T, I)
             g = torch.matmul(x, wg)
             del wu, wg
-            if sens_weights is not None:
+            if sens is not None:
+                m = ((sens["pos"] >= c0) & (sens["pos"] < c0 + len(ce))).unsqueeze(1)
+                local = (sens["pos"] - c0).clamp(0, len(ce) - 1) * T + sens["tok"]
+                sens["g"] = torch.where(m, g.view(-1, I).index_select(0, local), sens["g"])
+                sens["u"] = torch.where(m, u.view(-1, I).index_select(0, local), sens["u"])
+            elif sens_weights is not None:
                 sw = sens_weights[:, ce].T                # (C, T)
                 capture_out_sensitivity_batched(
                     params["capture_sens"], [self.gates[e] for e in ce], [self.ups[e] for e in ce],
-                    [self.downs[e] for e in ce], g, u, self.activation_fn, self.act_limit, sw,
-                    max_routed = None if _sens_all_rows else T * min(len(ce), self.num_experts_per_tok)
-                )
+                    [self.downs[e] for e in ce], g, u, self.activation_fn, self.act_limit, sw)
             self.activation_fn_call(g.view(-1, I), u.view(-1, I), u.view(-1, I), self.act_limit)   # a overwrites u
             del g
             if hbase is not None:
@@ -1800,6 +1819,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     finally:
                         params.pop("capture_row_w", None)
             del u
+        if sens is not None:
+            capture_out_sensitivity_routed(
+                params["capture_sens"], [self.gates[e] for e in experts], [self.ups[e] for e in experts],
+                [self.downs[e] for e in experts], sens["g"], sens["u"], sens["pos"], sens["wv"], sens["rows"],
+                self.activation_fn, self.act_limit)
 
 
     def _capture_H_shared_input(self, lins, x, params):
