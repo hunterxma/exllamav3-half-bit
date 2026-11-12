@@ -17,6 +17,7 @@
 #
 # Overrides: EXL3_VENV=path  CUDA_HOME=/usr/local/cuda-X.Y  TORCH_SPEC="torch==2.11.0"  MAX_JOBS=N
 #            EXL3_ARCH="8.6;12.0" (architectures to build)  EXL3_PIP_CUDA=1 (use the pip toolkit even if one is installed)
+#            EXL3_CUDA=12.8 (PyTorch CUDA family: 12.6, 12.8, 12.9 or 13.0; implies the pip toolkit)
 #            EXL3_NO_SELFTEST=1 (build only, e.g. while the GPU is busy)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -79,7 +80,7 @@ cands=()
 [ -n "${CUDA_HOME:-}" ] && cands+=("$CUDA_HOME/bin/nvcc")
 for d in /usr/local/cuda-*/bin/nvcc /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc; do [ -x "$d" ] && cands+=("$d"); done
 command -v nvcc >/dev/null && cands+=("$(command -v nvcc)")
-if [ -z "${EXL3_PIP_CUDA:-}" ]; then
+if [ -z "${EXL3_PIP_CUDA:-}" ] && [ -z "${EXL3_CUDA:-}" ]; then
   for n in "${cands[@]}"; do
     v=$("$n" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
     [ -n "$v" ] && [ -n "$(idx_of "$v")" ] || continue
@@ -97,16 +98,22 @@ if [ -n "$LOCAL" ]; then
   say "CUDA toolkit: $(dirname "$(dirname "$LOCAL")") (nvcc $LOCALV)"
 else
   FAMILY=""
-  for f in 13.0 12.9 12.8 12.6; do
+  for f in ${EXL3_CUDA:-13.0 12.9 12.8 12.6}; do
+    [ -n "$(idx_of "$f")" ] || die "EXL3_CUDA=$f: PyTorch builds exist for CUDA 12.6, 12.8, 12.9 and 13.0"
     if [ "$(ver $f)" -le "$(ver "$DRV_CUDA")" ] && [ "$(ver $f)" -ge "$(ver $NEED)" ]; then FAMILY=$f; break; fi
   done
+  [ -n "$FAMILY" ] || [ -z "${EXL3_CUDA:-}" ] || die "EXL3_CUDA=$EXL3_CUDA: needs CUDA $NEED..$DRV_CUDA (GPU minimum..driver)"
   [ -n "$FAMILY" ] || die "the driver supports CUDA $DRV_CUDA; this build needs a driver for CUDA $( [ "$(ver $NEED)" -gt "$(ver 12.6)" ] && echo "$NEED" || echo 12.6 ) or newer: update the NVIDIA driver"
-  say "no local CUDA toolkit the driver runs (found: ${cands[*]:-none}); will use NVIDIA's pip CUDA $FAMILY compiler in the venv"
+  [ -n "${EXL3_CUDA:-}${EXL3_PIP_CUDA:-}" ] && say "CUDA family $FAMILY; NVIDIA's pip CUDA compiler will be installed in the venv" \
+    || say "no local CUDA toolkit this driver runs (found: ${cands[*]:-none}); NVIDIA's pip CUDA compiler will be installed in the venv"
 fi
 IDX=$(idx_of "$FAMILY")
 TORCH_SPEC=${TORCH_SPEC:-torch}
 VENV=${EXL3_VENV:-$REPO/venv}
 if [ -n "${UV:-}" ]; then
+  # cache and venv on different filesystems: copy (uv would warn on every install that hardlinking failed)
+  UVC=$("$UV" cache dir 2>/dev/null || true); mkdir -p "$UVC" "$(dirname "$VENV")" 2>/dev/null || true
+  [ -n "$UVC" ] && [ "$(stat -c %d "$UVC" 2>/dev/null)" != "$(stat -c %d "$(dirname "$VENV")")" ] && export UV_LINK_MODE=${UV_LINK_MODE:-copy}
   [ -x "$VENV/bin/python" ] || "$UV" venv -q -p 3.12 "$VENV" || die "uv could not create the venv at $VENV"
   PIP=("$UV" pip install -p "$VENV/bin/python")
 else
@@ -152,8 +159,8 @@ PY
   # share one directory (nvidia/cu13), CUDA 12 wheels have one per component
   CUDA_HOME=$VENV/cuda; rm -rf "$CUDA_HOME"; mkdir -p "$CUDA_HOME/bin"
   for c in "$TK"/nvidia/*/; do
-    [ -d "${c}bin" ] && cp -rn "${c}bin/." "$CUDA_HOME/bin/"
-    for s in include lib nvvm; do [ -d "$c$s" ] && cp -rsn "$c$s" "$CUDA_HOME/" 2>/dev/null; done
+    [ -d "${c}bin" ] && cp -rf "${c}bin/." "$CUDA_HOME/bin/"
+    for s in include lib nvvm; do [ -d "$c$s" ] && cp -rsf "$c$s" "$CUDA_HOME/" 2>/dev/null; done
   done
   [ -x "$CUDA_HOME/bin/nvcc" ] || die "the pip CUDA toolkit has no nvcc (looked in $TK)"
   [ -e "$CUDA_HOME/lib64" ] || ln -s lib "$CUDA_HOME/lib64"
