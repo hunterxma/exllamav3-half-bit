@@ -2461,12 +2461,13 @@ Isa detect_isa()
 
 const Isa g_isa = []{ return detect_isa(); }();
 
-// Layout policy is immutable after extension load, like the ISA cap. Fractional packing
-// is opt-in: its first streamed use can require the existing GPU inverse ring.
+// Layout policy is immutable after extension load, like the ISA cap. Fractional (half-rate) packing is on by
+// default (EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=0 turns it off): 1.8-2.6x faster than unpacked at 4.5-7.5, and its first
+// streamed use goes through the existing GPU inverse ring (tests/moe_cpu/test_stream_layout.py)
 const bool g_fractional_swizzle = []{
     const char* e = std::getenv("EXL3_MOE_CPU_FRACTIONAL_SWIZZLE");
     const char* swz = std::getenv("EXL3_MOE_CPU_SWIZZLE");
-    return e && std::strcmp(e, "1") == 0 && !(swz && std::strcmp(swz, "0") == 0);
+    return !(e && std::strcmp(e, "0") == 0) && !(swz && std::strcmp(swz, "0") == 0);
 }();
 
 // ks (split-K slice, see KSlice): VBMI tier only and never K8, which that tier routes to the VNNI
