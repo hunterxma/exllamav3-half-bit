@@ -34,7 +34,13 @@ command -v nvidia-smi >/dev/null || die "nvidia-smi not found: install the NVIDI
 
 # 1. GPUs + driver: build for every distinct compute capability in the machine that exllamav3 supports
 DRV_CUDA=$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9]*\.[0-9]*\).*/\1/p' | head -1)
-[ -n "$DRV_CUDA" ] || die "could not read the driver's CUDA version from nvidia-smi (is the driver loaded?)"
+if [ -z "$DRV_CUDA" ]; then   # "CUDA Version: N/A" (e.g. a container without libcuda): from the driver version
+  DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+  [ -n "$DRV" ] || die "could not read the driver version from nvidia-smi (is the driver loaded?)"
+  DRV_CUDA=$( [ "$DRV" -ge 580 ] && echo 13.0 || { [ "$DRV" -ge 575 ] && echo 12.9; } || { [ "$DRV" -ge 570 ] && echo 12.8; } \
+             || { [ "$DRV" -ge 560 ] && echo 12.6; } || echo 12.4)
+  warn "nvidia-smi shows no CUDA version; driver $DRV supports CUDA $DRV_CUDA"
+fi
 ARCHS=""; NEED=11.4
 while IFS=, read -r cap name; do
   cap=$(echo "$cap" | tr -d ' '); name=$(echo "$name" | sed 's/^ *//')
