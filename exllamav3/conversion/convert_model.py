@@ -865,6 +865,32 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         t.join(timeout = 0.1)
 
 
+def phase_profiler(phase: str, idx: int):
+    """
+    EXL3_PROFILE_<phase>=<module idx>:<file> (phase CAPTURE or QUANT): a started torch.profiler over that phase of
+    that module, else None. phase_profiler_done writes the CPU-time and kernel-time tables to the file
+    """
+    spec = os.environ.get(f"EXL3_PROFILE_{phase}", "")
+    if not spec or int(spec.split(":", 1)[0]) != idx:
+        return None
+    prof = torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+    prof.__enter__()
+    prof.exl3_out = spec.split(":", 1)[1]
+    return prof
+
+
+def phase_profiler_done(prof):
+    if prof is None:
+        return
+    torch.cuda.synchronize()
+    prof.__exit__(None, None, None)
+    ka = prof.key_averages()
+    with open(prof.exl3_out, "w") as f:
+        f.write(ka.table(sort_by = "cpu_time_total", row_limit = 45) + "\n")
+        f.write(ka.table(sort_by = "self_cuda_time_total", row_limit = 35) + "\n")
+    print(f" -- Profile written to {prof.exl3_out}", flush = True)
+
+
 def check_bad_rows(bad_rows, num_rows, max_fraction = 0.10):
     """Abort the job when too much of the calibration set has been excluded as non-finite: past
     this point the remaining rows no longer represent the calibration distribution, and the
@@ -1517,6 +1543,7 @@ def main(args, job_state):
         free_mem()
 
         start_module_time = time.time()
+        phase_t = {}   # seconds per phase of this module (load, capture, quantize, save, forward), printed after it
         if idx == model.first_block_idx:
             timed_blocks = 0
 
@@ -1541,6 +1568,7 @@ def main(args, job_state):
             # Load current module
             slice_str = f" (slice {current_slice + 1}/{module.num_slices})" if slicing else ""
             print(f" -- Loading unquantized module: {module.key}" + slice_str)
+            t_phase = time.time()
             # Deferred mode batches every tensor of the module into coalesced, multithreaded
             # engine reads; big sparse layers otherwise pay one synchronous round trip per
             # expert tensor, which is latency-bound on slow/network storage. can_defer_load()
@@ -1564,6 +1592,7 @@ def main(args, job_state):
             module.config.stc.close()
 
             aff_store = None
+            phase_t["load"] = phase_t.get("load", 0) + time.time() - t_phase; t_phase = time.time()
 
             # Skip modules without quant targets
             qmaps = module.get_qmaps()
@@ -1573,6 +1602,7 @@ def main(args, job_state):
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
                 if state is not None:
+                    prof = phase_profiler("CAPTURE", idx)
                     capture_replicas, calib_devices = None, [module.device]
                     if parallel_calib and not module.caps.get("prefer_cpu"):
                         capture_replicas, calib_devices = load_parallel_calib_modules(
@@ -1652,6 +1682,7 @@ def main(args, job_state):
                     if aff_stores:
                         aff_store = merge_affinity_stores(aff_stores)
                         aff_stores = None
+                    phase_profiler_done(prof)
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
 
                     # More feedback
@@ -1668,6 +1699,8 @@ def main(args, job_state):
                         if infs or nans:
                             numel = v["num_total"]
                             print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
+
+            phase_t["capture"] = phase_t.get("capture", 0) + time.time() - t_phase; t_phase = time.time()
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
@@ -1701,12 +1734,16 @@ def main(args, job_state):
                     quantize_linears_single(
                         args, linears_, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H_, state, out_sens)
 
+            prof = phase_profiler("QUANT", idx)
+
             # Gate/up projections of experts with affinity-weighted Hessians: per expert, a few at a time
             if aff_store is not None and aff_store["layers"]:
                 linears = quantize_affinity_gate_up(module, linears, capture_H, aff_store, quantize_list, device)
                 aff_store = None
             if linears:
                 quantize_list(linears, capture_H)
+
+            phase_profiler_done(prof)
 
             # Collect converted module tensors
             for m in module:
@@ -1722,8 +1759,10 @@ def main(args, job_state):
                 module.unload()
             capture_H = None
             config.stc.close()
+            phase_t["quantize"] = phase_t.get("quantize", 0) + time.time() - t_phase
 
         # Save layer tensors to working directory
+        t_phase = time.time()
         clear_temp_files(args)
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
 
@@ -1748,6 +1787,8 @@ def main(args, job_state):
                 replica_models, idx, devices, None, source = q_tensors, need_bytes = _weight_bytes(module, q_tensors))
         config.stc.set_new_tensors(None)
         del q_tensors
+
+        phase_t["save+reload"] = time.time() - t_phase; t_phase = time.time()
 
         # Advance state
         error = 0
@@ -1816,8 +1857,10 @@ def main(args, job_state):
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding
         malloc_trim()
+        phase_t["forward"] = time.time() - t_phase
         module_time = time.time() - start_module_time
         feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time)
+        print(" -- Phases: " + "  ".join(f"{k} {v:.1f} s" for k, v in phase_t.items()), flush = True)
         report_auto_split()
         feedback_eta(idx, model, module_time)
 

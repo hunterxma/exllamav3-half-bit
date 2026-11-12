@@ -300,6 +300,26 @@ void quantize_tiles_frac
     };
     for (const auto& e : table) if (e.ka == KA && e.mask == (uint32_t) MASK) kernel = e.fn();
     TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");
+    // Register-resident variant (bit-identical, see quantize_tiles_frac_reg_kernel.cuh) unless EXL3_FRAC_REG=0.
+    // Threads per block: the faster of 512 / 1024 per rate on sm_120, or EXL3_FRAC_REG_NT
+    int threads = 512;
+    {
+        const char* env = getenv("EXL3_FRAC_REG");
+        const char* env_nt = getenv("EXL3_FRAC_REG_NT");
+        struct { int ka; int nt; fp_quantize_tiles_kernel (*fn)(); } const reg[] = {
+            {2, 512, &quantize_tiles_frac_reg_kernel_a2_maaaa_t512}, {2, 1024, &quantize_tiles_frac_reg_kernel_a2_maaaa_t1024},
+            {3, 512, &quantize_tiles_frac_reg_kernel_a3_maaaa_t512}, {3, 1024, &quantize_tiles_frac_reg_kernel_a3_maaaa_t1024},
+            {4, 512, &quantize_tiles_frac_reg_kernel_a4_maaaa_t512}, {4, 1024, &quantize_tiles_frac_reg_kernel_a4_maaaa_t1024},
+            {5, 512, &quantize_tiles_frac_reg_kernel_a5_maaaa_t512}, {5, 1024, &quantize_tiles_frac_reg_kernel_a5_maaaa_t1024},
+            {6, 512, &quantize_tiles_frac_reg_kernel_a6_maaaa_t512}, {6, 1024, &quantize_tiles_frac_reg_kernel_a6_maaaa_t1024},
+            {7, 512, &quantize_tiles_frac_reg_kernel_a7_maaaa_t512}, {7, 1024, &quantize_tiles_frac_reg_kernel_a7_maaaa_t1024},
+        };
+        // Measured with frac_reg_test.py: 1024 for KA 2-4 (byte-history stores dominate), 512 for 5-7 (no spills)
+        const int best_nt[8] = {0, 0, 1024, 1024, 1024, 512, 512, 512};
+        const int nt = env_nt ? atoi(env_nt) : (KA >= 0 && KA < 8 ? best_nt[KA] : 0);
+        if (!(env && env[0] == '0') && (uint32_t) MASK == 0xaaaau)
+            for (const auto& e : reg) if (e.ka == KA && e.nt == nt) { kernel = e.fn(); threads = nt; }
+    }
     const int num_tiles = input_tiles.size(0);
     if (!num_tiles) return;
     const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128 + (QTF_SMEM_COSTS(KA) ? 2 * edges_max * (int) sizeof(half) : 0);
@@ -310,14 +330,14 @@ void quantize_tiles_frac
     {
         int device, per_sm = 0;
         cuda_check(cudaGetDevice(&device));
-        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, 512, shmem));
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, shmem));
         const int wave = per_sm * DevCtx::instance().get_num_sms(device);
         if (wave > 0 && max_batch_size >= wave) max_batch_size -= max_batch_size % wave;
     }
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);
-        kernel<<<bsz, 512, shmem, stream>>>
+        kernel<<<bsz, threads, shmem, stream>>>
         (
             ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
             ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,

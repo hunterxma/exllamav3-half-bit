@@ -92,6 +92,9 @@ _expert_mask_cache = None
 # keeps the per-expert loop); a chunk holds about EXL3_CAPTURE_CHUNK_ROWS rows of all its experts (memory bound)
 _capture_batched = os.environ.get("EXL3_CAPTURE_BATCHED", "1") != "0"
 _capture_chunk_rows = int(os.environ.get("EXL3_CAPTURE_CHUNK_ROWS", 131072))
+# Output-sensitivity slopes of the routed (expert, row) pairs only (exact: unrouted rows weigh 0); EXL3_SENS_ALL_ROWS=1
+# evaluates every row as before
+_sens_all_rows = os.environ.get("EXL3_SENS_ALL_ROWS", "0") == "1"
 
 def _expert_mask() -> dict:
     global _expert_mask_cache
@@ -1766,7 +1769,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 sw = sens_weights[:, ce].T                # (C, T)
                 capture_out_sensitivity_batched(
                     params["capture_sens"], [self.gates[e] for e in ce], [self.ups[e] for e in ce],
-                    [self.downs[e] for e in ce], g, u, self.activation_fn, self.act_limit, sw
+                    [self.downs[e] for e in ce], g, u, self.activation_fn, self.act_limit, sw,
+                    max_routed = None if _sens_all_rows else T * min(len(ce), self.num_experts_per_tok)
                 )
             self.activation_fn_call(g.view(-1, I), u.view(-1, I), u.view(-1, I), self.act_limit)   # a overwrites u
             del g

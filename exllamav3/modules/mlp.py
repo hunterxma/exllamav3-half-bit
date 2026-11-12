@@ -130,21 +130,42 @@ def capture_out_sensitivity_batched(
     activation_fn: str,
     act_limit: float,
     weights: torch.Tensor,
+    max_routed: int | None = None,
 ):
     """
     capture_out_sensitivity for C experts at once: g, u (C, T, n), weights (C, T) routing weights (0 = not routed).
     The slopes are elementwise, so one call over all C x T rows gives each expert's rows exactly; per expert the sum
     of squares over its rows and the routed-row count go into its accumulators, as C separate calls would.
+
+    max_routed: an upper bound on the routed (expert, row) pairs, e.g. top-k x T. With it only those rows are
+    evaluated (an unrouted row has weight 0 and adds exactly nothing), about k / num_experts of the work, gathered
+    with a fixed-size nonzero (no host sync) and summed per expert by a prefix sum over the expert-major rows
+    (deterministic)
     """
     C, T, n = g.shape
-    slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+    rows = (weights != 0).sum(dim = 1)
+    if max_routed is not None and max_routed < C * T:
+        S = max_routed
+        flat = weights.reshape(-1)
+        idx = torch.nonzero_static(flat != 0, size = S, fill_value = C * T).flatten()
+        valid = idx < C * T
+        idx = idx.clamp(max = C * T - 1)
+        wv = (flat.index_select(0, idx).float() * valid).reshape(-1, 1)
+        slopes = gated_act_slopes(activation_fn, g.reshape(-1, n).index_select(0, idx), u.reshape(-1, n).index_select(0, idx), act_limit)
+        off = rows.cumsum(0)
+        prev = off - rows
+        def per_expert(c):
+            cs = torch.cat((torch.zeros((1, n), dtype = torch.double, device = c.device), c.double().square().cumsum(0)))
+            return cs.index_select(0, off) - cs.index_select(0, prev)   # (C, n)
+    else:
+        slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+        wv = weights.float().reshape(-1, 1)
+        per_expert = lambda c: c.double().square().view(C, T, n).sum(dim = 1)   # noqa: E731
     if slopes is None:
         return
-    wv = weights.float().reshape(-1, 1)
-    rows = (weights != 0).sum(dim = 1)
     for lins, c in zip((ups, gates), slopes):
         c = torch.nan_to_num(c * wv, nan = 0.0, posinf = 0.0, neginf = 0.0)
-        sq = c.double().square().view(C, T, n).sum(dim = 1)       # (C, n)
+        sq = per_expert(c)       # (C, n)
         for i, linear in enumerate(lins):
             if linear is None or linear.qmap is None:
                 continue

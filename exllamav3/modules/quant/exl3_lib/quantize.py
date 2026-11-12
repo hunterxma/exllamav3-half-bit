@@ -2029,6 +2029,10 @@ class _WeightStager:
         return dev_w.float() if dev_w.dtype != torch.float else dev_w
 
 
+# Named ranges for torch.profiler (EXL3_PROFILE_QUANT in convert_model); no cost without a profiler
+_rf = torch.profiler.record_function
+
+
 def quantize_exl3_batch(
     weights: list[torch.Tensor],
     H_datas: list[dict],
@@ -2083,7 +2087,8 @@ def quantize_exl3_batch(
             # device, which would otherwise factor every tensor of the layer for all threads
             if "H_swap_device" in H_datas[t]:
                 H_datas[t]["H_swap_device"] = device
-            q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
+            with _rf("q.finalize_H"):
+                q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
             if q_fallback:
                 finalized.append(None)
             else:
@@ -2119,13 +2124,15 @@ def quantize_exl3_batch(
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
             # Original kept for the post-LDLQ scale refit (regularize works in place)
             origs[t] = weight.clone() if weight.numel() <= 5e7 or NO_SWAP else weight.cpu()
-            apply_out_scales, weight_r, _, su, sv = regularize(
-                weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
+            with _rf("q.regularize"):
+                apply_out_scales, weight_r, _, su, sv = regularize(
+                    weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
-        samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
-        scales = g_scale_search_batch(samples, qa0)
+        with _rf("q.g_scale_search"):
+            samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
+            scales = g_scale_search_batch(samples, qa0)
         del samples
         g_scales = {}
         for t, (g_scale, _) in zip(batch_idx, scales):
@@ -2153,7 +2160,8 @@ def quantize_exl3_batch(
             weight_r_cat = torch.cat([regs[t][0] for t in batch_idx], dim = 1)
             for t in batch_idx:
                 regs[t][0] = None
-            weight_q_cat, encoded_cat = ldlq(weight_r_cat, L, qa0, pb)
+            with _rf("q.ldlq"):
+                weight_q_cat, encoded_cat = ldlq(weight_r_cat, L, qa0, pb)
             L = None   # device copy stays cached in H_data for the layer's remaining groups
             weight_rs = list(torch.split(weight_r_cat, widths, dim = 1))
             weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
@@ -2178,7 +2186,8 @@ def quantize_exl3_batch(
                 weight_r_stack = torch.stack([regs[t][0] for t in ts])
                 for t in ts:
                     regs[t][0] = None
-                weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb if len(by_shape) == 1 else None)
+                with _rf("q.ldlq_batched"):
+                    weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb if len(by_shape) == 1 else None)
                 del Ls
                 for t, wr, wq, enc in zip(ts, weight_r_stack.unbind(0), weight_q_stack.unbind(0), encoded_stack.unbind(0)):
                     outs[t] = (wr, wq, enc)
@@ -2211,11 +2220,12 @@ def quantize_exl3_batch(
             else:
                 Hd = finalized[t][0].to(device)
             try:
-                E = weight_rs[bi] - weight_qs[bi]
-                num = block_trace(E, Hd)
-                E = None
-                den = block_trace(weight_rs[bi], Hd)
-                proxy_err = num / max(den, 1e-8)
+                with _rf("q.proxy_err"):
+                    E = weight_rs[bi] - weight_qs[bi]
+                    num = block_trace(E, Hd)
+                    E = None
+                    den = block_trace(weight_rs[bi], Hd)
+                    proxy_err = num / max(den, 1e-8)
             except torch.OutOfMemoryError:
                 E = None
                 proxy_err = -1.0
@@ -2223,26 +2233,28 @@ def quantize_exl3_batch(
 
             # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
             if not qa.get("no_refit"):
-                wq = weight_qs[bi].to(device)
-                wq = preapply_had_l_(wq, had_k)
-                wq *= su
-                wq = preapply_had_r_(wq, had_n)
-                wq *= sv
-                H_orig = unrotate_H(Hd, H_datas[t]["su"])
-                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
-                                                                damping = damping_share(qa))
-                del wq, H_orig
-                su = su_f.view(-1, 1).to(su.dtype)
-                sv = sv_f.view(1, -1).to(sv.dtype)
-                if verbose:
-                    print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
-                proxy_err = e_after
+                with _rf("q.refit"):
+                    wq = weight_qs[bi].to(device)
+                    wq = preapply_had_l_(wq, had_k)
+                    wq *= su
+                    wq = preapply_had_r_(wq, had_n)
+                    wq *= sv
+                    H_orig = unrotate_H(Hd, H_datas[t]["su"])
+                    _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
+                                                                    damping = damping_share(qa))
+                    del wq, H_orig
+                    su = su_f.view(-1, 1).to(su.dtype)
+                    sv = sv_f.view(1, -1).to(sv.dtype)
+                    if verbose:
+                        print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+                    proxy_err = e_after
             origs[t] = None
             weight_qs[bi] = None
 
             suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
             svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
-            trellis = pack_trellis(encodeds[bi].contiguous(), qa)
+            with _rf("q.pack"):
+                trellis = pack_trellis(encodeds[bi].contiguous(), qa)
             encodeds[bi] = None
 
             out_tensors = {

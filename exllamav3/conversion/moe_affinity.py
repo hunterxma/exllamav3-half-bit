@@ -115,15 +115,16 @@ def quantize_gate_up(module, linears: list, capture_H: dict, store: dict, quanti
             saved = []
             for e, g, u in batch:
                 # rows routed to expert e and their routing weights
-                hit = (S == e)
-                rows = hit.any(dim = 1).nonzero().flatten()
-                B = torch.zeros((X.shape[1], X.shape[1]), dtype = torch.float, device = device)
-                for r in range(0, rows.numel(), ROW_CHUNK):
-                    ri = rows[r : r + ROW_CHUNK]
-                    xc = X.index_select(0, ri).float()
-                    wc = (W.index_select(0, ri).float() * hit.index_select(0, ri)).sum(dim = 1, keepdim = True).clamp_min_(0)
-                    B.addmm_((xc * wc).T, xc)
-                H = B.div_(n).add_(H_shared, alpha = eps * p_mean[e].item())
+                with torch.profiler.record_function("aff.build_H"):
+                    hit = (S == e)
+                    rows = hit.any(dim = 1).nonzero().flatten()
+                    B = torch.zeros((X.shape[1], X.shape[1]), dtype = torch.float, device = device)
+                    for r in range(0, rows.numel(), ROW_CHUNK):
+                        ri = rows[r : r + ROW_CHUNK]
+                        xc = X.index_select(0, ri).float()
+                        wc = (W.index_select(0, ri).float() * hit.index_select(0, ri)).sum(dim = 1, keepdim = True).clamp_min_(0)
+                        B.addmm_((xc * wc).T, xc)
+                    H = B.div_(n).add_(H_shared, alpha = eps * p_mean[e].item())
                 qmap = f"{shared_qmap}.aff{e}"
                 # Swapped like the captured Hessians, so the quantization thread moves it to its own device
                 local[qmap] = {
