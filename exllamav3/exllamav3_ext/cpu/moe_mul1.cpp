@@ -151,7 +151,7 @@ constexpr std::array<uint16_t, 256> make_tc_perm_inv()
     return inv;
 }
 
-// Bitrate of a tile: `bits` per weight, or bits + 0.5 with `hb` (the half-integer rates 1.5 / 2.5 / 3.5,
+// Bitrate of a tile: `bits` per weight, or bits + 0.5 with `hb` (the half-integer rates 1.5 .. 7.5,
 // where consecutive states advance bits and bits + 1 alternately). In half-bit units:
 constexpr int rate_k2(int bits, bool hb) { return 2 * bits + (hb ? 1 : 0); }
 // Packed size of one 256-weight tile, in u16 and in u32 words
@@ -2494,6 +2494,22 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 3 * 4 + 1: vbmi_tiles<3, true, 2>(mat, in, tout, tn0, tn1, ks); return;
                     case 3 * 4 + 2: vbmi_tiles<3, true, 3>(mat, in, tout, tn0, tn1, ks); return;
                     case 3 * 4 + 3: vbmi_tiles<3, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 4 * 4 + 0: vbmi_tiles<4, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 4 * 4 + 1: vbmi_tiles<4, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 4 * 4 + 2: vbmi_tiles<4, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 4 * 4 + 3: vbmi_tiles<4, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 5 * 4 + 0: vbmi_tiles<5, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 5 * 4 + 1: vbmi_tiles<5, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 5 * 4 + 2: vbmi_tiles<5, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 5 * 4 + 3: vbmi_tiles<5, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 6 * 4 + 0: vbmi_tiles<6, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 6 * 4 + 1: vbmi_tiles<6, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 6 * 4 + 2: vbmi_tiles<6, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 6 * 4 + 3: vbmi_tiles<6, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 7 * 4 + 0: vbmi_tiles<7, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 7 * 4 + 1: vbmi_tiles<7, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 7 * 4 + 2: vbmi_tiles<7, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 7 * 4 + 3: vbmi_tiles<7, true, 4>(mat, in, tout, tn0, tn1, ks); return;
                 }
                 return;
             }
@@ -2554,6 +2570,22 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 3 * 4 + 1: vnni_tiles<3, true, 2>(mat, in, tout, tn0, tn1); return;
                     case 3 * 4 + 2: vnni_tiles<3, true, 3>(mat, in, tout, tn0, tn1); return;
                     case 3 * 4 + 3: vnni_tiles<3, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 0: vnni_tiles<4, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 1: vnni_tiles<4, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 2: vnni_tiles<4, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 3: vnni_tiles<4, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 0: vnni_tiles<5, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 1: vnni_tiles<5, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 2: vnni_tiles<5, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 3: vnni_tiles<5, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 0: vnni_tiles<6, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 1: vnni_tiles<6, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 2: vnni_tiles<6, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 3: vnni_tiles<6, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 0: vnni_tiles<7, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 1: vnni_tiles<7, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 2: vnni_tiles<7, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 3: vnni_tiles<7, true, 4>(mat, in, tout, tn0, tn1); return;
                 }
                 return;
             }
@@ -2612,6 +2644,22 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 3 * 4 + 1: bw_tiles_any<3, true, 2>(mat, in, tout, tn0, tn1); return;
                     case 3 * 4 + 2: bw_tiles_any<3, true, 3>(mat, in, tout, tn0, tn1); return;
                     case 3 * 4 + 3: bw_tiles_any<3, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 0: bw_tiles_any<4, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 1: bw_tiles_any<4, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 2: bw_tiles_any<4, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 4 * 4 + 3: bw_tiles_any<4, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 0: bw_tiles_any<5, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 1: bw_tiles_any<5, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 2: bw_tiles_any<5, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 5 * 4 + 3: bw_tiles_any<5, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 0: bw_tiles_any<6, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 1: bw_tiles_any<6, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 2: bw_tiles_any<6, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 6 * 4 + 3: bw_tiles_any<6, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 0: bw_tiles_any<7, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 1: bw_tiles_any<7, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 2: bw_tiles_any<7, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 7 * 4 + 3: bw_tiles_any<7, true, 4>(mat, in, tout, tn0, tn1); return;
                 }
                 return;
             }
@@ -2741,6 +2789,10 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 1: AVX2_HB_ROWS(1)
                     case 2: AVX2_HB_ROWS(2)
                     case 3: AVX2_HB_ROWS(3)
+                    case 4: AVX2_HB_ROWS(4)
+                    case 5: AVX2_HB_ROWS(5)
+                    case 6: AVX2_HB_ROWS(6)
+                    case 7: AVX2_HB_ROWS(7)
                 }
                 #undef AVX2_HB_ROWS
                 return;
@@ -2766,6 +2818,10 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 1: scalar_tiles<1, true>(mat, in, tout, m, tn0, tn1); return;
                     case 2: scalar_tiles<2, true>(mat, in, tout, m, tn0, tn1); return;
                     case 3: scalar_tiles<3, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 4: scalar_tiles<4, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 5: scalar_tiles<5, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 6: scalar_tiles<6, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 7: scalar_tiles<7, true>(mat, in, tout, m, tn0, tn1); return;
                 }
                 return;
             }
@@ -3818,7 +3874,7 @@ static MoeCpuMatrix make_matrix
     const int tile_w = static_cast<int>(trellis.size(2));
     m.bits = tile_w / 16;
     m.hb = tile_w % 16 == 8 ? 1 : 0;
-    TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
+    TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 7), "unsupported trellis tile width ", tile_w);
     // The caller repacks each tensor with the group exl3_moe_cpu_swizzle_group returns for
     // this matrix's rate; apply the same rule here so the flag matches the bytes per tensor
     m.swz = swizzled && exl3_moe_cpu_swizzle_group(tile_w / 16.0) ? 1 : 0;

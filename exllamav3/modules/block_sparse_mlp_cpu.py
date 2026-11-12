@@ -419,11 +419,11 @@ def _split_promote_verify(m, t):
 
 def trellis_rate(tile_width: int):
     """Bitrate of an EXL3 trellis from its tile width (last dim): an integer 1..8 for 16 * K, a
-    half-integer 1.5 / 2.5 / 3.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
+    half-integer 1.5 .. 7.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
     K, rem = divmod(tile_width, 16)
     if rem == 0 and 1 <= K <= 8:
         return K
-    if rem == 8 and 1 <= K <= 3:
+    if rem == 8 and 1 <= K <= 7:
         return K + 0.5
     return None
 

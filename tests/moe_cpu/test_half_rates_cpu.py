@@ -1,5 +1,5 @@
 """
-CPU expert kernels (ext.exl3_moe_cpu_*) at every trellis rate, half-integer (1.5 / 2.5 / 3.5 bpw, mul1) and
+CPU expert kernels (ext.exl3_moe_cpu_*) at every trellis rate, half-integer (1.5 .. 7.5 bpw, mul1) and
 integer, native and the tier's packed layout (band-8 on AVX-512, band-2 + planar on AVX2): the rate decode of a
 trellis width (trellis_rate), each layer's forward against
 the GPU dense reconstruct path (testlib.moe.expert_mlp_ref), and agreement between the instruction set tiers (the
@@ -15,7 +15,7 @@ from testlib.exl3 import rand_experts
 from testlib.moe import expert_mlp_ref
 from testlib.moe_cpu import INT8_TIERS, run_per_tier, swizzle, swizzle_layouts
 
-ALL_RATES = (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8)
+ALL_RATES = (1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8)
 
 # Expert e gets e + 1 tokens: the CPU kernels take a group of 1 to 4 rows per call
 CPU_E, CPU_H, CPU_I = 4, 512, 256
@@ -57,9 +57,8 @@ def cpu_outputs():
 def test_trellis_rate():
     assert [trellis_rate(16 * k) for k in range(1, 9)] == list(range(1, 9))
     assert [trellis_rate(w) for w in (24, 40, 56)] == [1.5, 2.5, 3.5]
-    # 4.5 .. 7.5 (tile widths 72 .. 120) have GPU kernels only: the CPU offload declines them (experts stay on the GPU)
-    assert [trellis_rate(w) for w in (72, 88, 104, 120)] == [None] * 4
-    for w in (0, 8, 72, 136, 144, 20, 60):
+    assert [trellis_rate(w) for w in (72, 88, 104, 120)] == [4.5, 5.5, 6.5, 7.5]
+    for w in (0, 8, 136, 144, 20, 60):
         assert trellis_rate(w) is None
 
 
