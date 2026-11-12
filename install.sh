@@ -3,109 +3,221 @@
 #
 #   bash install.sh                 # from a checkout of this repo
 #
+# Needs only the NVIDIA driver, a C++ compiler and curl or git; everything else is fetched into the repo directory.
 # What it does, failing early with a plain message instead of a compiler error:
-#   1. finds the GPU and its compute capability (nvidia-smi) and the newest CUDA the driver supports
-#   2. finds a CUDA toolkit (nvcc) new enough for that GPU and not newer than the driver
-#   3. creates a venv (default ./venv, or $EXL3_VENV) and installs the matching PyTorch build
-#   4. compiles the extension for this GPU only (minutes, not the hour an all-architecture build takes)
-#   5. runs the self-test (python -m exllamav3.util.selftest)
+#   1. finds every GPU's compute capability and the newest CUDA the driver runs (nvidia-smi)
+#   2. checks disk space and the C++ compiler; gets uv (a self-contained Python + package manager) if it is missing
+#   3. picks the CUDA family: a local toolkit (nvcc) the driver runs if there is one, else the newest the driver runs;
+#      creates a venv (default ./venv, or $EXL3_VENV) with the matching PyTorch build
+#   4. no usable local toolkit: installs NVIDIA's pip CUDA compiler of exactly PyTorch's CUDA version into the venv
+#      (no root, no download page)
+#   5. compiles a tiny kernel first (catches a host compiler nvcc does not accept and tries an older g++), then the
+#      extension for the GPUs in this machine only (minutes, not the hour an all-architecture build takes)
+#   6. runs the self-test (python -m exllamav3.util.selftest)
 #
-# Overrides: EXL3_VENV=path  CUDA_HOME=/usr/local/cuda-X.Y  TORCH_SPEC="torch==2.11.0"  MAX_JOBS=N  EXL3_ARCH=12.0
+# Overrides: EXL3_VENV=path  CUDA_HOME=/usr/local/cuda-X.Y  TORCH_SPEC="torch==2.11.0"  MAX_JOBS=N
+#            EXL3_ARCH="8.6;12.0" (architectures to build)  EXL3_PIP_CUDA=1 (use the pip toolkit even if one is installed)
 #            EXL3_NO_SELFTEST=1 (build only, e.g. while the GPU is busy)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 REPO=$PWD
+T0=$(date +%s)
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[33mWARNING: %s\033[0m\n' "$*" >&2; }
 die() { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
-ver() { printf '%d%03d' "${1%%.*}" "${1#*.}"; }   # "12.8" -> 12008, comparable as integers
+ver() { printf '%d%03d' "${1%%.*}" "$(echo "${1#*.}" | cut -d. -f1)"; }   # "12.8" -> 12008, comparable as integers
 
 [ "$(uname -s)" = Linux ] || die "this installer is for Linux (Windows: see README, build with VS Build Tools)"
-command -v nvidia-smi >/dev/null || die "nvidia-smi not found: install the NVIDIA driver first"
+[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] || die "unsupported CPU architecture $(uname -m) (x86_64 or aarch64)"
+command -v nvidia-smi >/dev/null || die "nvidia-smi not found: install the NVIDIA driver first (AMD GPUs: build with ROCm, see README)"
 
-# 1. GPU + driver
-ARCH=${EXL3_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')}
-GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+# 1. GPUs + driver: build for every distinct compute capability in the machine that exllamav3 supports
 DRV_CUDA=$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9]*\.[0-9]*\).*/\1/p' | head -1)
-[ -n "$ARCH" ] && [ -n "$DRV_CUDA" ] || die "could not read the GPU compute capability / driver CUDA version from nvidia-smi"
-case "$ARCH" in
-  12.*|10.*) NEED=12.8 ;;     # Blackwell
-  9.0)       NEED=12.0 ;;     # Hopper
-  8.9)       NEED=11.8 ;;     # Ada
-  8.*)       NEED=11.4 ;;     # Ampere
-  7.5)       NEED=11.4 ;;     # Turing
-  *) die "GPU $GPU (sm_${ARCH/./}) is not supported (exllamav3 needs compute capability 7.5 or newer)" ;;
-esac
-say "GPU: $GPU (compute $ARCH), driver supports CUDA $DRV_CUDA"
+[ -n "$DRV_CUDA" ] || die "could not read the driver's CUDA version from nvidia-smi (is the driver loaded?)"
+ARCHS=""; NEED=11.4
+while IFS=, read -r cap name; do
+  cap=$(echo "$cap" | tr -d ' '); name=$(echo "$name" | sed 's/^ *//')
+  [ -n "${EXL3_ARCH:-}" ] && break
+  if [ "$(ver "$cap")" -lt "$(ver 7.5)" ]; then warn "skipping $name (compute $cap): exllamav3 needs compute capability 7.5 or newer"; continue; fi
+  case ";$ARCHS;" in *";$cap;"*) ;; *) ARCHS=${ARCHS:+$ARCHS;}$cap ;; esac
+  say "GPU: $name (compute $cap)"
+done < <(nvidia-smi --query-gpu=compute_cap,name --format=csv,noheader)
+ARCHS=${EXL3_ARCH:-$ARCHS}
+[ -n "$ARCHS" ] || die "no supported NVIDIA GPU found (exllamav3 needs compute capability 7.5 or newer: RTX 20xx / T4 and later)"
+for cap in ${ARCHS//;/ }; do
+  case "$cap" in
+    12.*|10.*|11.*) n=12.8 ;;   # Blackwell
+    9.*) n=12.0 ;;              # Hopper
+    8.9) n=11.8 ;;              # Ada
+    *) n=11.4 ;;                # Ampere, Turing
+  esac
+  [ "$(ver $n)" -gt "$(ver $NEED)" ] && NEED=$n
+done
+say "driver supports CUDA $DRV_CUDA; building for compute $ARCHS (needs CUDA $NEED or newer)"
 
-# 2. CUDA toolkit: CUDA_HOME if given, else the newest nvcc that is >= NEED and <= the driver's CUDA
-pick=""; best=0
+# 2. Preflight: disk, C++ compiler, uv
+FREE_GB=$(df -Pk "$REPO" | awk 'NR == 2 {print int($4 / 1048576)}')
+[ "$FREE_GB" -ge 8 ] || die "only $FREE_GB GB free in $REPO; the install needs about 12 GB (PyTorch, CUDA compiler, build)"
+[ "$FREE_GB" -ge 15 ] || warn "$FREE_GB GB free in $REPO; the install needs about 12 GB"
+command -v g++ >/dev/null || command -v c++ >/dev/null || die "no C++ compiler found (Debian/Ubuntu: sudo apt install build-essential; Fedora: sudo dnf install gcc-c++)"
+UV=$(command -v uv || true)
+[ -z "$UV" ] && [ -x "$REPO/.uv/uv" ] && UV=$REPO/.uv/uv
+if [ -z "$UV" ]; then
+  # uv brings its own Python (with headers and venv), so no system Python packages are needed
+  say "getting uv into $REPO/.uv (Python + package manager, ~40 MB, nothing installed system-wide)"
+  if command -v curl >/dev/null; then GET=(curl -LsSf); elif command -v wget >/dev/null; then GET=(wget -qO-); else GET=(); fi
+  [ ${#GET[@]} -gt 0 ] && "${GET[@]}" https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$REPO/.uv" UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh >/dev/null 2>&1 \
+    && UV=$REPO/.uv/uv
+  [ -x "${UV:-}" ] || warn "could not get uv; falling back to the system Python"
+fi
+
+# 3. CUDA family + venv + PyTorch. A local toolkit the driver runs keeps its family (PyTorch must match nvcc's major);
+#    otherwise the newest family the driver runs, and the pip toolkit below.
+idx_of() { case "$1" in 13.*) echo cu130 ;; 12.9) echo cu129 ;; 12.8) echo cu128 ;; 12.6|12.7) echo cu126 ;; *) echo "" ;; esac; }
+LOCAL=""; LOCALV=""; best=0
 cands=()
 [ -n "${CUDA_HOME:-}" ] && cands+=("$CUDA_HOME/bin/nvcc")
 for d in /usr/local/cuda-*/bin/nvcc /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc; do [ -x "$d" ] && cands+=("$d"); done
 command -v nvcc >/dev/null && cands+=("$(command -v nvcc)")
-for n in "${cands[@]}"; do
-  v=$("$n" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
-  [ -n "$v" ] || continue
-  if [ -n "${CUDA_HOME:-}" ] && [ "$n" = "$CUDA_HOME/bin/nvcc" ]; then pick=$n; PICKV=$v; break; fi
-  if [ "$(ver "$v")" -ge "$(ver $NEED)" ] && [ "$(ver "$v")" -le "$(ver "$DRV_CUDA")" ] && [ "$(ver "$v")" -gt "$best" ]; then
-    pick=$n; PICKV=$v; best=$(ver "$v")
-  fi
-done
-if [ -z "$pick" ]; then
-  found=$(for n in "${cands[@]}"; do printf '%s ' "$n ($("$n" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p'))"; done)
-  die "no CUDA toolkit between $NEED (needed for compute $ARCH) and $DRV_CUDA (driver) was found.
-  Found: ${found:-none}
-  Install one from https://developer.nvidia.com/cuda-downloads (toolkit only), or set CUDA_HOME=/path/to/cuda"
+if [ -z "${EXL3_PIP_CUDA:-}" ]; then
+  for n in "${cands[@]}"; do
+    v=$("$n" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
+    [ -n "$v" ] && [ -n "$(idx_of "$v")" ] || continue
+    if [ -n "${CUDA_HOME:-}" ] && [ "$n" = "$CUDA_HOME/bin/nvcc" ]; then
+      [ "$(ver "$v")" -ge "$(ver $NEED)" ] || die "CUDA_HOME=$CUDA_HOME is CUDA $v; compute $ARCHS needs $NEED or newer"
+      LOCAL=$n; LOCALV=$v; break
+    fi
+    if [ "$(ver "$v")" -ge "$(ver $NEED)" ] && [ "$(ver "$v")" -le "$(ver "$DRV_CUDA")" ] && [ "$(ver "$v")" -gt "$best" ]; then
+      LOCAL=$n; LOCALV=$v; best=$(ver "$v")
+    fi
+  done
 fi
-[ "$(ver "$PICKV")" -ge "$(ver $NEED)" ] || die "CUDA_HOME=$CUDA_HOME is CUDA $PICKV; compute $ARCH needs $NEED or newer"
-export CUDA_HOME=$(dirname "$(dirname "$pick")"); export PATH=$CUDA_HOME/bin:$PATH
-say "CUDA toolkit: $CUDA_HOME (nvcc $PICKV)"
-
-# 3. venv + PyTorch built for the same CUDA major.minor family as the toolkit
-case "$PICKV" in
-  13.*)      IDX=cu130 ;;
-  12.8|12.9) IDX=cu128 ;;
-  12.6|12.7) IDX=cu126 ;;
-  12.4|12.5) IDX=cu124 ;;
-  *) die "CUDA $PICKV has no matching PyTorch build; use CUDA 12.4 or newer" ;;
-esac
+if [ -n "$LOCAL" ]; then
+  FAMILY=$LOCALV
+  say "CUDA toolkit: $(dirname "$(dirname "$LOCAL")") (nvcc $LOCALV)"
+else
+  FAMILY=""
+  for f in 13.0 12.9 12.8 12.6; do
+    if [ "$(ver $f)" -le "$(ver "$DRV_CUDA")" ] && [ "$(ver $f)" -ge "$(ver $NEED)" ]; then FAMILY=$f; break; fi
+  done
+  [ -n "$FAMILY" ] || die "the driver supports CUDA $DRV_CUDA; this build needs a driver for CUDA $( [ "$(ver $NEED)" -gt "$(ver 12.6)" ] && echo "$NEED" || echo 12.6 ) or newer: update the NVIDIA driver"
+  say "no local CUDA toolkit the driver runs (found: ${cands[*]:-none}); will use NVIDIA's pip CUDA $FAMILY compiler in the venv"
+fi
+IDX=$(idx_of "$FAMILY")
 TORCH_SPEC=${TORCH_SPEC:-torch}
 VENV=${EXL3_VENV:-$REPO/venv}
-if command -v uv >/dev/null; then
-  [ -x "$VENV/bin/python" ] || uv venv -q -p 3.12 "$VENV"
-  PIP=(uv pip install -p "$VENV/bin/python")
+if [ -n "${UV:-}" ]; then
+  [ -x "$VENV/bin/python" ] || "$UV" venv -q -p 3.12 "$VENV" || die "uv could not create the venv at $VENV"
+  PIP=("$UV" pip install -p "$VENV/bin/python")
 else
-  # every dependency (torch included) ships wheels for 3.10 .. 3.14; prefer the most widely tested
   PY=$(command -v python3.12 || command -v python3.13 || command -v python3.11 || command -v python3.14 || command -v python3.10 || command -v python3 || true)
-  [ -n "$PY" ] || die "no python3 found (3.10 .. 3.14 supported)"
+  [ -n "$PY" ] || die "no python3 found (3.10 .. 3.14 supported), and uv could not be fetched"
   "$PY" -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 14)' 2>/dev/null || die "$PY is $("$PY" -V 2>&1); 3.10 .. 3.14 is supported"
-  [ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV" || die "python venv module missing (Debian/Ubuntu: apt install python3-venv)"
+  "$PY" -c 'import sysconfig, os, sys; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")))' \
+    || die "$PY has no development headers (Debian/Ubuntu: sudo apt install python3-dev python3-venv), or install uv: https://docs.astral.sh/uv/"
+  [ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV" || die "python venv module missing (Debian/Ubuntu: sudo apt install python3-venv)"
   "$VENV/bin/python" -m pip install -q --upgrade pip
   PIP=("$VENV/bin/python" -m pip install)
 fi
 say "venv: $VENV; installing $TORCH_SPEC ($IDX)"
 "${PIP[@]}" "$TORCH_SPEC" numpy --index-url "https://download.pytorch.org/whl/$IDX" >/dev/null   # numpy now: torch warns on import without it
 TCUDA=$("$VENV/bin/python" -c 'import torch; print(torch.version.cuda or "")')
-[ "${TCUDA%%.*}" = "${PICKV%%.*}" ] || die "PyTorch was built for CUDA $TCUDA but the toolkit is $PICKV (majors must match)"
+[ -n "$TCUDA" ] || die "the installed PyTorch has no CUDA support (index $IDX)"
+
+# 4. CUDA toolkit: the local one, or NVIDIA's pip toolkit. The cuda-toolkit metapackage pins one coherent release
+#    (compiler, NVVM, headers, libraries) and goes into its own directory, never over PyTorch's CUDA packages. Version:
+#    the newest release of PyTorch's CUDA major the driver runs (only the major must match PyTorch; an older minor can
+#    clash with a newer glibc's math headers).
+pip_toolkit() {
+  local CV TK c s
+  CV=$("$VENV/bin/python" - "$TCUDA" "$DRV_CUDA" <<'PY'
+import json, sys, urllib.request
+torch_cuda, drv = sys.argv[1], sys.argv[2]
+key = lambda v: tuple(int(x) for x in v.split(".")[:2])
+try:
+    rel = json.load(urllib.request.urlopen("https://pypi.org/pypi/cuda-toolkit/json", timeout=30))["releases"]
+    ok = sorted({".".join(v.split(".")[:2]) for v, files in rel.items() if files and v[0].isdigit() and "rc" not in v
+                 and v.split(".")[0] == torch_cuda.split(".")[0] and key(torch_cuda) <= key(v) <= key(drv)}, key=key)
+    print(ok[-1] if ok else torch_cuda)
+except Exception:
+    print(torch_cuda)
+PY
+)
+  TK=$VENV/cuda-toolkit-$CV
+  say "installing NVIDIA's CUDA $CV compiler into $TK (PyTorch is CUDA $TCUDA)"
+  [ -x "$TK/nvidia/cu${CV%%.*}/bin/nvcc" ] || [ -x "$TK/nvidia/cuda_nvcc/bin/nvcc" ] || \
+    "${PIP[@]}" -q --target "$TK" "cuda-toolkit[nvcc,cccl,cudart,curand,cublas,cusparse,cusolver]==$CV.*" \
+    || die "could not install the CUDA $CV compiler from pip"
+  # one toolkit tree: bin copied (nvcc finds nvvm and headers relative to itself), the rest linked. CUDA 13 wheels
+  # share one directory (nvidia/cu13), CUDA 12 wheels have one per component
+  CUDA_HOME=$VENV/cuda; rm -rf "$CUDA_HOME"; mkdir -p "$CUDA_HOME/bin"
+  for c in "$TK"/nvidia/*/; do
+    [ -d "${c}bin" ] && cp -rn "${c}bin/." "$CUDA_HOME/bin/"
+    for s in include lib nvvm; do [ -d "$c$s" ] && cp -rsn "$c$s" "$CUDA_HOME/" 2>/dev/null; done
+  done
+  [ -x "$CUDA_HOME/bin/nvcc" ] || die "the pip CUDA toolkit has no nvcc (looked in $TK)"
+  [ -e "$CUDA_HOME/lib64" ] || ln -s lib "$CUDA_HOME/lib64"
+  export CUDA_HOME
+}
+
+# 5. Compile check (seconds) with the headers the extension uses, incl. <cmath> (a glibc newer than the CUDA release
+#    breaks there): nvcc accepts the host compiler and builds for these GPUs. CUDA releases cap the gcc version; when the
+#    default is too new, try the installed older ones. A local toolkit that fails falls back to the pip one.
+PROBE=$(mktemp -d); trap 'rm -rf "$PROBE"' EXIT
+printf '#include <cmath>\n#include <math.h>\n#include <cuda_runtime.h>\n#include <cooperative_groups.h>\n#include <curand_kernel.h>\n#include <cuda/std/cstdint>\n__global__ void k(float* x) { x[threadIdx.x] = rsqrtf(x[threadIdx.x]); }\n' > "$PROBE/t.cu"
+GENS=(); for cap in ${ARCHS//;/ }; do GENS+=(-gencode "arch=compute_${cap/./},code=sm_${cap/./}"); done
+probe() { "$CUDA_HOME/bin/nvcc" ${1:+-ccbin "$1"} "${GENS[@]}" -c "$PROBE/t.cu" -o "$PROBE/t.o" > "$PROBE/log" 2>&1; }
+compiles() {   # with the default host compiler, else an older installed g++ (sets CUDAHOSTCXX)
+  probe "" && return 0
+  grep -qiE "unsupported (GNU|clang) version|host compiler" "$PROBE/log" || return 1
+  local gxx
+  for gxx in $(ls /usr/bin/g++-[0-9]* 2>/dev/null | sort -t- -k2 -rn); do
+    if probe "$gxx"; then export CUDAHOSTCXX=$gxx; say "nvcc does not accept the default g++; using $gxx"; return 0; fi
+  done
+  return 1
+}
+if [ -n "$LOCAL" ]; then
+  [ "${TCUDA%%.*}" = "${LOCALV%%.*}" ] || die "PyTorch was built for CUDA $TCUDA but the toolkit is $LOCALV (majors must match)"
+  export CUDA_HOME=$(dirname "$(dirname "$LOCAL")")
+  if ! compiles; then
+    sed -n '1,4p' "$PROBE/log" >&2
+    warn "the local CUDA $LOCALV toolkit cannot compile here (above); using NVIDIA's pip toolkit instead"
+    pip_toolkit
+  fi
+else
+  pip_toolkit
+fi
+if ! probe "${CUDAHOSTCXX:-}" && ! compiles; then
+  sed -n '1,8p' "$PROBE/log" >&2
+  die "nvcc could not compile a test kernel (above). If it names an unsupported compiler version, install an older g++
+  (Debian/Ubuntu: sudo apt install g++-13) and rerun, or set CUDAHOSTCXX=/usr/bin/g++-N"
+fi
+say "CUDA compiler: $CUDA_HOME ($("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'))${CUDAHOSTCXX:+, host $CUDAHOSTCXX}"
+export PATH=$CUDA_HOME/bin:$PATH
 "${PIP[@]}" -q setuptools wheel ninja
 "${PIP[@]}" -q -r "$REPO/requirements_examples.txt"   # examples/chat.py and friends work straight after install
 
-# 4. Build for this GPU only. RAM bounds parallelism: each nvcc job can take ~3 GB
+# 6. Build for these GPUs only. RAM bounds parallelism: each nvcc job can take ~3 GB
 CORES=$(nproc); RAM_GB=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)
 JOBS=${MAX_JOBS:-$(( CORES < RAM_GB / 3 ? CORES : RAM_GB / 3 ))}; [ "$JOBS" -ge 1 ] || JOBS=1
 LOG=$REPO/build.log
-say "building the extension for compute $ARCH with $JOBS jobs (typically 10-30 min; log: $LOG)"
-if ! TORCH_CUDA_ARCH_LIST=$ARCH MAX_JOBS=$JOBS "${PIP[@]}" --no-build-isolation -v "$REPO" > "$LOG" 2>&1; then
+say "building the extension for compute $ARCHS with $JOBS jobs (typically 10-30 min; log: $LOG)"
+if ! TORCH_CUDA_ARCH_LIST=$ARCHS MAX_JOBS=$JOBS "${PIP[@]}" --no-build-isolation -v "$REPO" > "$LOG" 2>&1; then
   grep -m5 -E "error|Error|fatal" "$LOG" >&2 || true
+  grep -q -i "killed" "$LOG" && warn "a compiler process was killed (out of memory?): rerun with MAX_JOBS=$(( JOBS / 2 > 0 ? JOBS / 2 : 1 ))"
   die "build failed; the first errors are above, full log in $LOG"
 fi
 
-# JIT-compiled kernels (tests, extensions loaded at runtime) must use the same toolkit as the build, not whatever
-# nvcc is first on PATH
-grep -q "EXL3 install.sh" "$VENV/bin/activate" || printf '\n# EXL3 install.sh: CUDA toolkit the extension was built with\nexport CUDA_HOME="%s"\nexport PATH="$CUDA_HOME/bin:$PATH"\n' "$CUDA_HOME" >> "$VENV/bin/activate"
+# JIT-compiled kernels (tests, extensions loaded at runtime) must use the same toolkit and host compiler as the build,
+# not whatever nvcc is first on PATH
+sed -i '/# EXL3 install.sh/,$d' "$VENV/bin/activate"
+{ printf '\n# EXL3 install.sh: CUDA toolkit the extension was built with\nexport CUDA_HOME="%s"\nexport PATH="$CUDA_HOME/bin:$PATH"\n' "$CUDA_HOME"
+  [ -n "${CUDAHOSTCXX:-}" ] && printf 'export CUDAHOSTCXX="%s"\n' "$CUDAHOSTCXX"; true; } >> "$VENV/bin/activate"
 
-# 5. Self-test
-[ -n "${EXL3_NO_SELFTEST:-}" ] && { say "built; self-test skipped (EXL3_NO_SELFTEST). Run: $VENV/bin/python -m exllamav3.util.selftest"; exit 0; }
+# 7. Self-test
+MIN=$(( ($(date +%s) - T0) / 60 ))
+[ -n "${EXL3_NO_SELFTEST:-}" ] && { say "built in $MIN min; self-test skipped (EXL3_NO_SELFTEST). Run: $VENV/bin/python -m exllamav3.util.selftest"; exit 0; }
 say "self-test"
 "$VENV/bin/python" -m exllamav3.util.selftest || die "self-test failed (see above)"
-say "done. Activate with: source $VENV/bin/activate"
+say "done in $MIN min. Activate with: source $VENV/bin/activate
+    chat with an EXL3 model:  python examples/chat.py -m /path/to/model -mode <prompt format>  (python examples/chat.py -modes lists them)"
