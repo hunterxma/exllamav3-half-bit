@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import heapq
+import re
 from collections import defaultdict
 
 """
@@ -93,6 +94,17 @@ def main(args):
 
     for r in tensors + head:
         r["S"] = sensitivity(r)
+    # A second measurement (e.g. long rows): each target it covers takes the worse sensitivity of the two
+    for path in args.measurement_extra or []:
+        with open(path, "r") as f:
+            extra = {r["key"]: r for r in json.load(f)["results"]}
+        raised = 0
+        for r in tensors + head:
+            if r["key"] in extra:
+                s2 = sensitivity(extra[r["key"]])
+                if s2 > r["S"]:
+                    r["S"], raised = s2, raised + 1
+        print(f" -- {path}: {len(extra)} targets, {raised} raised to the worse sensitivity")
         if r["key"] not in anchor and args.rfn_ref:
             raise ValueError(f"{r['key']} missing from {args.rfn_ref}")
 
@@ -118,6 +130,8 @@ def main(args):
     tie_sets = [set(part.split("+")) for part in args.tie.split(",")] if args.tie.strip() else []
 
     def group_of(key):
+        if args.tie_tiers:  # one bitrate per projection over all traffic tiers (fused MoE kernel: one K per projection)
+            key = re.sub(r"\.experts\.t\d+\.", ".experts.", key)
         parent, _, leaf = key.rpartition(".")
         for gi, s in enumerate(tie_sets):
             if leaf in s:
@@ -174,22 +188,38 @@ def main(args):
     def kld_at_g(g, k):
         return sum(kld_at(r, k) for r in g)
 
+    skip = [float(x) for x in args.skip_k_experts.split(",")] if args.skip_k_experts else []
+    is_expert = [any(".experts." in r["key"] for r in g) for g in groups]
+    def up(i, k):  # next rate above k for group i, None past max_k
+        k = k + step
+        while is_expert[i] and any(abs(k - x) < 1e-9 for x in skip):
+            k += step
+        return k if k <= args.max_k + 1e-9 else None
+    def down(i, k):
+        k = k - step
+        while is_expert[i] and any(abs(k - x) < 1e-9 for x in skip):
+            k -= step
+        return k if k >= args.min_k - 1e-9 else None
+
     heap = []
     for i, g in enumerate(groups):
-        if args.min_k < args.max_k:
-            gain = kld_at_g(g, args.min_k) - kld_at_g(g, args.min_k + step)
-            heapq.heappush(heap, (-gain / cost_g[i], i, args.min_k + step))
+        nk = up(i, args.min_k)
+        if nk is not None:
+            gain = kld_at_g(g, args.min_k) - kld_at_g(g, nk)
+            heapq.heappush(heap, (-gain / (cost_g[i] * (nk - args.min_k)), i, nk))
     while heap:
         neg_density, i, next_k = heapq.heappop(heap)
-        if spent + numel_g[i] * step > budget:
+        d = next_k - k_group[i]
+        if spent + numel_g[i] * d > budget:
             # Later increments for this group only get worse per bit; drop it and let smaller
             # groups keep filling the remainder
             continue
         k_group[i] = next_k
-        spent += numel_g[i] * step
-        if next_k < args.max_k - 1e-9:
-            gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], next_k + step)
-            heapq.heappush(heap, (-gain / cost_g[i], i, next_k + step))
+        spent += numel_g[i] * d
+        nk = up(i, next_k)
+        if nk is not None:
+            gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], nk)
+            heapq.heappush(heap, (-gain / (cost_g[i] * (nk - next_k)), i, nk))
 
     # Exchange repair: a group (especially a tied pair, whose increments are twice the size) can
     # be stranded at a low K when its next increment stops fitting the remaining budget while
@@ -204,23 +234,25 @@ def main(args):
         # Demotion candidates, cheapest loss per freed bit first, shared across promotions
         cands = []
         for j, h in enumerate(groups):
-            if k_group[j] > args.min_k + 1e-9:
-                loss = kld_at_g(h, k_group[j] - step) - kld_at_g(h, k_group[j])
-                cands.append((loss / (cost_g[j] * step), loss, numel_g[j] * step, j))
+            dk = down(j, k_group[j])
+            if dk is not None:
+                loss = kld_at_g(h, dk) - kld_at_g(h, k_group[j])
+                cands.append((loss / (cost_g[j] * (k_group[j] - dk)), loss, numel_g[j] * (k_group[j] - dk), j, dk))
         cands.sort()
         best = None  # (kld improvement, promote group, [demote groups])
         for i, g in enumerate(groups):
-            if k_group[i] >= args.max_k - 1e-9:
+            uk = up(i, k_group[i])
+            if uk is None:
                 continue
-            gain = kld_at_g(g, k_group[i]) - kld_at_g(g, k_group[i] + step)
-            need = numel_g[i] * step - leftover
+            gain = kld_at_g(g, k_group[i]) - kld_at_g(g, uk)
+            need = numel_g[i] * (uk - k_group[i]) - leftover
             demote, loss_sum = [], 0.0
-            for _, loss, nj, j in cands:
+            for _, loss, nj, j, dk in cands:
                 if need <= 0:
                     break
                 if j == i:
                     continue
-                demote.append(j)
+                demote.append((j, dk))
                 loss_sum += loss
                 need -= nj
             if need > 0:
@@ -229,18 +261,18 @@ def main(args):
             # per unit of the greedy's exchange rate; at lambda 0 this is the plain KLD test
             delta = gain - loss_sum
             if lam:
-                d_read = cost_g[i] * step - sum(cost_g[j] * step for j in demote)
-                delta -= max(0.0, d_read) * (gain / (cost_g[i] * step))
+                d_read = cost_g[i] * (uk - k_group[i]) - sum(cost_g[j] * (k_group[j] - dk) for j, dk in demote)
+                delta -= max(0.0, d_read) * (gain / (cost_g[i] * (uk - k_group[i])))
             if delta > 0 and (best is None or delta > best[0]):
-                best = (delta, i, demote)
+                best = (delta, i, uk, demote)
         if best is None:
             break
-        _, i, demote = best
-        k_group[i] += step
-        spent += numel_g[i] * step
-        for j in demote:
-            k_group[j] -= step
-            spent -= numel_g[j] * step
+        _, i, uk, demote = best
+        spent += numel_g[i] * (uk - k_group[i])
+        k_group[i] = uk
+        for j, dk in demote:
+            spent -= numel_g[j] * (k_group[j] - dk)
+            k_group[j] = dk
         exchanges += 1
     if exchanges:
         print(f" -- Exchange repair: {exchanges} move(s)")
@@ -371,6 +403,9 @@ if __name__ == "__main__":
     parser.add_argument("-tie", "--tie", type = str, default = "q_proj+k_proj+v_proj,gate_proj+up_proj,in_proj_qkv+in_proj_z",
                         help = "Suffix groups forced to share a bitrate (fused GEMMs in the inference paths), tied within the same parent module. Pass \"\" to optimize all "
                                "tensors independently. Default: k_proj+v_proj,gate_proj+up_proj")
+    parser.add_argument("-ml", "--measurement_extra", type = str, action = "append", help = "Further measurement JSON (e.g. long rows); per target the worse sensitivity is used. Repeatable")
+    parser.add_argument("-ske", "--skip_k_experts", type = str, default = "", help = "Comma-separated rates routed-expert groups may not use (rates a fused MoE kernel cannot run), e.g. 4.5")
+    parser.add_argument("-tt", "--tie_tiers", action = "store_true", help = "Tie a layer's expert traffic tiers (t0, t1, ...) to one bitrate per projection")
     parser.add_argument("-o", "--out", type = str, required = True, help = "Output recipe (YAML)")
     parser.add_argument("-t", "--table", type = str, default = None, help = "Optionally save full predicted per-tensor per-K KLD table (JSON)")
     main(parser.parse_args())
