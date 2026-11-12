@@ -473,6 +473,18 @@ class SafetensorsCollection:
         if overrides:
             print(f" !! Replaced {overrides} tensors from {directory}")
 
+        # A sharded checkpoint's model.safetensors.index.json names the file of every tensor: when present it
+        # decides, not the order the shards were scanned in (several shards may hold the same key, e.g. a hybrid
+        # whose shards are links to two builds)
+        index = os.path.join(directory, "model.safetensors.index.json") if os.path.isdir(directory) else None
+        if index and os.path.isfile(index):
+            with open(index) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            for key, fname in weight_map.items():
+                st_file = os.path.join(directory, fname)
+                if st_file in self.file_headers and key in self.file_headers[st_file]:
+                    self.tensor_file_map[key] = st_file
+
 
     def has_tensor(
         self,
