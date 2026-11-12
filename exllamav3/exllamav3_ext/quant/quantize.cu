@@ -304,7 +304,16 @@ void quantize_tiles_frac
     if (!num_tiles) return;
     const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128 + (QTF_SMEM_COSTS(KA) ? 2 * edges_max * (int) sizeof(half) : 0);
     cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
-    const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
+    // Launch whole waves: the scratch holds 128 tiles, but 128 blocks at 1-2 resident per SM leave the last wave
+    // partly idle; round the batch down to a multiple of the co-resident block count (measured per instance)
+    int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
+    {
+        int device, per_sm = 0;
+        cuda_check(cudaGetDevice(&device));
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, 512, shmem));
+        const int wave = per_sm * DevCtx::instance().get_num_sms(device);
+        if (wave > 0 && max_batch_size >= wave) max_batch_size -= max_batch_size % wave;
+    }
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);

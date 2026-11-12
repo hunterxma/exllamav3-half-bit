@@ -46,18 +46,27 @@ __device__ __forceinline__ void qt_frac_step
     const half2 inf2 = __half2half2(H_INF);
     constexpr uint32_t product_step = 0x83DCD12Du << Kr;
 
-    for (int out_edge_idx = 2 * thread; out_edge_idx < edges_out; out_edge_idx += 2 * QTF_NT)
+    // Fewer out-edge pairs than threads (KOUT >= 8 at 512 threads, i.e. the 6.5 / 7.5 rates): G adjacent lanes share
+    // a pair, each taking every G-th candidate, and the packed minima are reduced across the G lanes. min() of the
+    // packed keys is order independent, so the result is bit-identical to one lane scanning every candidate
+    constexpr int pairs = edges_out / 2;
+    constexpr int G = pairs >= QTF_NT ? 1 : QTF_NT / pairs;
+    static_assert(G <= 32 && (G & (G - 1)) == 0, "lane group must be a power of two within a warp");
+    const int sub = thread % G;
+
+    for (int out_edge_idx = 2 * (thread / G); out_edge_idx < edges_out; out_edge_idx += 2 * (QTF_NT / G))
     {
-        uint32_t product0 = out_edge_idx * 0x83DCD12Du;
+        uint32_t product0 = out_edge_idx * 0x83DCD12Du + (uint32_t) sub * (0x83DCD12Du << Kr);
         uint32_t product1 = product0 + 0x83DCD12Du;
         uint32_t best0 = 0xffffffffu, best1 = 0xffffffffu;
         #pragma unroll
-        for (int k = 0; k < max_q; ++k)
+        for (int kk = 0; kk < max_q / G; ++kk)
         {
+            const int k = kk * G + sub;
             const int in_edge_idx = ((k << Kr) | out_edge_idx) >> KIN;
             const half2 dh2 = __hsub2(decode_mul1_product_2(product0, product1), w2);
-            product0 += product_step;
-            product1 += product_step;
+            product0 += product_step * G;
+            product1 += product_step * G;
             half2 err2;
             if (first)
             {
@@ -69,10 +78,19 @@ __device__ __forceinline__ void qt_frac_step
             best0 = min(best0, ((uint32_t) __half_as_ushort(__low2half(err2)) << 16) | (uint32_t) in_edge_idx);
             best1 = min(best1, ((uint32_t) __half_as_ushort(__high2half(err2)) << 16) | (uint32_t) in_edge_idx);
         }
-        reinterpret_cast<half2*>(costs_out)[out_edge_idx >> 1] =
-            __halves2half2(__ushort_as_half((uint16_t) (best0 >> 16)), __ushort_as_half((uint16_t) (best1 >> 16)));
-        if (write_hist)
-            reinterpret_cast<uint32_t*>(hist_row)[out_edge_idx >> 1] = (best0 & 0xffffu) | (best1 << 16);
+        #pragma unroll
+        for (int o = 1; o < G; o <<= 1)
+        {
+            best0 = min(best0, __shfl_xor_sync(0xffffffffu, best0, o));
+            best1 = min(best1, __shfl_xor_sync(0xffffffffu, best1, o));
+        }
+        if (sub == 0)
+        {
+            reinterpret_cast<half2*>(costs_out)[out_edge_idx >> 1] =
+                __halves2half2(__ushort_as_half((uint16_t) (best0 >> 16)), __ushort_as_half((uint16_t) (best1 >> 16)));
+            if (write_hist)
+                reinterpret_cast<uint32_t*>(hist_row)[out_edge_idx >> 1] = (best0 & 0xffffu) | (best1 << 16);
+        }
     }
 }
 
