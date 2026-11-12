@@ -131,20 +131,26 @@ say "venv: $VENV; installing $TORCH_SPEC ($IDX)"
 TCUDA=$("$VENV/bin/python" -c 'import torch; print(torch.version.cuda or "")')
 [ -n "$TCUDA" ] || die "the installed PyTorch has no CUDA support (index $IDX)"
 
-# 4. CUDA toolkit: the local one, or NVIDIA's pip toolkit. The cuda-toolkit metapackage pins one coherent release
-#    (compiler, NVVM, headers, libraries) and goes into its own directory, never over PyTorch's CUDA packages. Version:
-#    the newest release of PyTorch's CUDA major the driver runs (only the major must match PyTorch; an older minor can
-#    clash with a newer glibc's math headers).
-pip_toolkit() {
+# 4. CUDA toolkit: the local one, or NVIDIA's own packages in the venv (no root). Version: the newest release of
+#    PyTorch's CUDA major the driver runs (only the major must match PyTorch; an older minor can clash with a newer
+#    glibc's math headers). CUDA 13+: the pip cuda-toolkit metapackage (one coherent release) in its own directory,
+#    never over PyTorch's CUDA packages. CUDA 12: NVIDIA's redist compiler archives + PyTorch's CUDA wheels.
+pip_toolkit() {   # CUDA 13+: NVIDIA's pip cuda-toolkit. CUDA 12: its pip wheel has no nvcc, so NVIDIA's redist archives
   local CV TK c s
   CV=$("$VENV/bin/python" - "$TCUDA" "$DRV_CUDA" <<'PY'
-import json, sys, urllib.request
+import json, re, sys, urllib.request
 torch_cuda, drv = sys.argv[1], sys.argv[2]
 key = lambda v: tuple(int(x) for x in v.split(".")[:2])
+fit = lambda v: v.split(".")[0] == torch_cuda.split(".")[0] and key(torch_cuda) <= key(v) <= key(drv)
 try:
-    rel = json.load(urllib.request.urlopen("https://pypi.org/pypi/cuda-toolkit/json", timeout=30))["releases"]
-    ok = sorted({".".join(v.split(".")[:2]) for v, files in rel.items() if files and v[0].isdigit() and "rc" not in v
-                 and v.split(".")[0] == torch_cuda.split(".")[0] and key(torch_cuda) <= key(v) <= key(drv)}, key=key)
+    if int(torch_cuda.split(".")[0]) >= 13:
+        rel = json.load(urllib.request.urlopen("https://pypi.org/pypi/cuda-toolkit/json", timeout=30))["releases"]
+        ok = [v for v, f in rel.items() if f and re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?", v) and fit(v)]
+        ok = sorted({".".join(v.split(".")[:2]) for v in ok}, key=key)
+    else:   # full x.y.z of the newest redist release
+        page = urllib.request.urlopen("https://developer.download.nvidia.com/compute/cuda/redist/", timeout=30).read().decode()
+        ok = sorted({v for v in re.findall(r"redistrib_(\d+\.\d+\.\d+)\.json", page) if fit(v)},
+                    key=lambda v: tuple(int(x) for x in v.split(".")))
     print(ok[-1] if ok else torch_cuda)
 except Exception:
     print(torch_cuda)
@@ -152,17 +158,51 @@ PY
 )
   TK=$VENV/cuda-toolkit-$CV
   say "installing NVIDIA's CUDA $CV compiler into $TK (PyTorch is CUDA $TCUDA)"
-  [ -x "$TK/nvidia/cu${CV%%.*}/bin/nvcc" ] || [ -x "$TK/nvidia/cuda_nvcc/bin/nvcc" ] || \
-    "${PIP[@]}" -q --target "$TK" "cuda-toolkit[nvcc,cccl,cudart,curand,cublas,cusparse,cusolver]==$CV.*" \
-    || die "could not install the CUDA $CV compiler from pip"
-  # one toolkit tree: bin copied (nvcc finds nvvm and headers relative to itself), the rest linked. CUDA 13 wheels
-  # share one directory (nvidia/cu13), CUDA 12 wheels have one per component
-  CUDA_HOME=$VENV/cuda; rm -rf "$CUDA_HOME"; mkdir -p "$CUDA_HOME/bin"
-  for c in "$TK"/nvidia/*/; do
-    [ -d "${c}bin" ] && cp -rf "${c}bin/." "$CUDA_HOME/bin/"
-    for s in include lib nvvm; do [ -d "$c$s" ] && cp -rsf "$c$s" "$CUDA_HOME/" 2>/dev/null; done
-  done
-  [ -x "$CUDA_HOME/bin/nvcc" ] || die "the pip CUDA toolkit has no nvcc (looked in $TK)"
+  CUDA_HOME=$VENV/cuda; rm -rf "$CUDA_HOME"; mkdir -p "$CUDA_HOME/bin" "$CUDA_HOME/lib"
+  if [ "${CV%%.*}" -ge 13 ]; then
+    [ -x "$TK/nvidia/cu${CV%%.*}/bin/nvcc" ] || \
+      "${PIP[@]}" -q --target "$TK" "cuda-toolkit[nvcc,cccl,cudart,curand,cublas,cusparse,cusolver]==$CV.*" \
+      || die "could not install the CUDA $CV compiler from pip"
+    for c in "$TK"/nvidia/*/; do
+      [ -d "${c}bin" ] && cp -rf "${c}bin/." "$CUDA_HOME/bin/"
+      for s in include lib nvvm; do [ -d "$c$s" ] && cp -rsf "$c$s" "$CUDA_HOME/" 2>/dev/null; done
+    done
+  else
+    # compiler (nvcc + NVVM + CRT) and CCCL from NVIDIA's redistributable archives, checked against the manifest's
+    # sha256; runtime, cuBLAS, cuSPARSE, cuRAND and cuSOLVER headers and libraries come with PyTorch's own wheels
+    [ -x "$TK/cuda_nvcc/bin/nvcc" ] || "$VENV/bin/python" - "$CV" "$TK" <<'PY' || die "could not download the CUDA $CV compiler"
+import hashlib, json, sys, tarfile, urllib.request, pathlib
+cv, tk = sys.argv[1], pathlib.Path(sys.argv[2])
+base = "https://developer.download.nvidia.com/compute/cuda/redist/"
+man = json.load(urllib.request.urlopen(f"{base}redistrib_{cv}.json", timeout=60))
+arch = {"x86_64": "linux-x86_64", "aarch64": "linux-sbsa"}[__import__("platform").machine()]
+tk.mkdir(parents=True, exist_ok=True)
+for comp in ("cuda_nvcc", "cuda_cccl"):
+    e = man[comp][arch]
+    data = urllib.request.urlopen(base + e["relative_path"], timeout=600).read()
+    if hashlib.sha256(data).hexdigest() != e["sha256"]:
+        sys.exit(f"{comp}: sha256 mismatch")
+    out = tk / comp; out.mkdir(exist_ok=True)
+    tmp = tk / f"{comp}.tar.xz"; tmp.write_bytes(data)
+    with tarfile.open(tmp) as t:
+        top = t.getnames()[0].split("/")[0]
+        for m in t.getmembers():
+            m.name = m.name[len(top) + 1:] if m.name.startswith(top + "/") else ""
+            if m.name:
+                try: t.extract(m, out, filter="tar")
+                except TypeError: t.extract(m, out)   # Python without extraction filters (< 3.10.12 / 3.11.4)
+    tmp.unlink()
+PY
+    cp -rf "$TK/cuda_nvcc/bin/." "$CUDA_HOME/bin/"
+    cp -rsf "$TK/cuda_nvcc/nvvm" "$CUDA_HOME/"
+    local site; site=$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+    for c in "$TK/cuda_nvcc" "$TK/cuda_cccl" "$site"/nvidia/*; do
+      for s in include lib; do [ -d "$c/$s" ] && cp -rsf "$c/$s" "$CUDA_HOME/" 2>/dev/null; done
+    done
+    # the build links -lcudart; PyTorch's wheel has only the versioned library
+    [ -e "$CUDA_HOME/lib/libcudart.so" ] || ln -sf "$(ls "$CUDA_HOME"/lib/libcudart.so.* | head -1)" "$CUDA_HOME/lib/libcudart.so"
+  fi
+  [ -x "$CUDA_HOME/bin/nvcc" ] || die "the CUDA $CV toolkit has no nvcc (looked in $TK)"
   [ -e "$CUDA_HOME/lib64" ] || ln -s lib "$CUDA_HOME/lib64"
   export CUDA_HOME
 }
