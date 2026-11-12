@@ -81,6 +81,23 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 # use is on those paths except the grouped DS3 router (n_group > 1, Ling 3.x), which is still
 # torch-composed (fp32 logits) and keeps the broadcast
 _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
+
+# EXL3_EXPERT_MASK=<json file {mlp key: [expert index, ...]}>: route around the listed experts, i.e. prune them without
+# a convert (to measure what dropping cold experts costs before building a pruned model). A -30000 logit bias before
+# top-k (the gpt-oss router-bias path of routing_std): masked experts are never picked, and the weights renormalize
+# over the picked set exactly as a model without those experts would
+_expert_mask_cache = None
+
+def _expert_mask() -> dict:
+    global _expert_mask_cache
+    if _expert_mask_cache is None:
+        path = os.environ.get("EXL3_EXPERT_MASK")
+        _expert_mask_cache = {}
+        if path:
+            import json
+            with open(path, "r") as f:
+                _expert_mask_cache = json.load(f)
+    return _expert_mask_cache
 _routing_check_stats = {}
 
 def _routing_check_compare(key, local_sel, local_w, sel, w):
@@ -790,6 +807,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             topk_group = self.topk_group,
             per_expert_scale = per_expert_scale,
         )
+
+        mask = _expert_mask().get(self.key)
+        if mask:
+            assert self.routing_fn in (routing_std, routing_std_bias), "EXL3_EXPERT_MASK: softmax routers only"
+            bias = torch.zeros((self.num_experts,), dtype = torch.half, device = self.device)
+            bias[torch.tensor(mask, dtype = torch.long)] = -30000.0
+            if self.routing_cfg.router_bias is not None:
+                bias += self.routing_cfg.router_bias.half()
+            self.routing_cfg.router_bias = bias
+            self.routing_fn = routing_std_bias
 
 
     @override

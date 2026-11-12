@@ -25,7 +25,7 @@ def proj(E, k, n, K, gen, device):
 
 
 @torch.inference_mode()
-def bench(E, H, I, top_k, Kgu, Kd, bsz, runs, cb, device):
+def bench(E, H, I, top_k, Kgu, Kd, bsz, runs, cb, device, graph = False):
     gen = torch.Generator().manual_seed(0)
     keep_g, g = proj(E, H, I, Kgu, gen, device)
     keep_u, u = proj(E, H, I, Kgu, gen, device)
@@ -46,9 +46,22 @@ def bench(E, H, I, top_k, Kgu, Kd, bsz, runs, cb, device):
     for i in range(10): call(i)
     torch.cuda.synchronize()
     t0, t1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
-    t0.record()
-    for i in range(10, runs + 10): call(i)
-    t1.record(); torch.cuda.synchronize()
+    if graph:
+        # --graph: the calls captured into one CUDA graph, as a graphed decode step runs them: GPU time only,
+        # without the per-call host submission that bounds the eager loop when the kernels are short
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            call(0); torch.cuda.synchronize()
+            cg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cg, stream = s):
+                for i in range(10, runs + 10): call(i)
+        torch.cuda.current_stream().wait_stream(s)
+        cg.replay(); torch.cuda.synchronize()
+        t0.record(); cg.replay(); t1.record(); torch.cuda.synchronize()
+    else:
+        t0.record()
+        for i in range(10, runs + 10): call(i)
+        t1.record(); torch.cuda.synchronize()
     us = t0.elapsed_time(t1) * 1000 / runs
     distinct = sum(len(set(s.reshape(-1).tolist())) for s in sels[10:]) / runs
     return us, distinct * (2 * H * I * Kgu + I * H * Kd) / 8 / (us * 1e-6) / 1e9
@@ -61,8 +74,9 @@ def main():
     ap.add_argument("--rates", default = "2,2.5,3,3.5,4,4.5,5,5.5,6"); ap.add_argument("--mixed", default = "3:4,4:5,3.5:4.5,2.5:3.5")
     ap.add_argument("--tokens", default = "1,2,6"); ap.add_argument("--runs", type = int, default = 300)
     ap.add_argument("--cb", default = "mul1", choices = ["mul1", "mcg"]); ap.add_argument("--device", default = "cuda:0")
+    ap.add_argument("--graph", action = "store_true", help = "Time the calls replayed from a CUDA graph (GPU time, no host submission)")
     a = ap.parse_args()
-    print(f"{torch.cuda.get_device_properties(a.device).name}  exl3_moe_coop  E={a.experts} H={a.hidden} I={a.inter} top_k={a.top_k} cb={a.cb}")
+    print(f"{torch.cuda.get_device_properties(a.device).name}  exl3_moe_coop{'  (CUDA graph)' if a.graph else ''}  E={a.experts} H={a.hidden} I={a.inter} top_k={a.top_k} cb={a.cb}")
     cases = [(float(r), float(r)) for r in a.rates.split(",") if r] + [tuple(float(x) for x in m.split(":")) for m in a.mixed.split(",") if m]
     toks = [int(t) for t in a.tokens.split(",")]
     print("gate/up  down  " + "  ".join(f"{t:>2} tok: us    GB/s" for t in toks))
@@ -72,7 +86,7 @@ def main():
         row = []
         for t in toks:
             try:
-                us, gbs = bench(a.experts, a.hidden, a.inter, a.top_k, Kgu, Kd, t, a.runs, a.cb, a.device)
+                us, gbs = bench(a.experts, a.hidden, a.inter, a.top_k, Kgu, Kd, t, a.runs, a.cb, a.device, a.graph)
                 row.append(f"{us:9.1f} {gbs:7.1f}")
             except Exception as e:
                 row.append(f"{'err':>9} {str(e)[:7]:>7}")
