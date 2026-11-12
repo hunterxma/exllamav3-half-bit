@@ -96,8 +96,9 @@ _capture_chunk_rows = int(os.environ.get("EXL3_CAPTURE_CHUNK_ROWS", 131072))
 # evaluates every row as before
 _sens_all_rows = os.environ.get("EXL3_SENS_ALL_ROWS", "0") == "1"
 # Hessian capture of a chunk's down projections in one batched accumulation (and the shared gate/up input counted
-# once), instead of ~18 small launches per expert per row; EXL3_CAPTURE_H_BATCHED=0 keeps the per-expert calls
-_capture_h_batched = os.environ.get("EXL3_CAPTURE_H_BATCHED", "1") != "0"
+# once), instead of ~18 small launches per expert per row (EXL3_CAPTURE_H_BATCHED=1). Identical results, but the
+# launches overlap the GPU work, so it measured no faster: off by default
+_capture_h_batched = os.environ.get("EXL3_CAPTURE_H_BATCHED", "0") == "1"   # measured: no gain without a profiler
 
 def _expert_mask() -> dict:
     global _expert_mask_cache
