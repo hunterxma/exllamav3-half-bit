@@ -236,6 +236,10 @@ else
 fi
 if ! probe "${CUDAHOSTCXX:-}" && ! compiles; then
   sed -n '1,8p' "$PROBE/log" >&2
+  if grep -q "mathcalls.h" "$PROBE/log"; then
+    die "CUDA $("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p') headers do not compile with this system's glibc $(ldd --version | head -1 | awk '{print $NF}') (above).
+  CUDA 13 does: $( [ "$(ver "$DRV_CUDA")" -ge "$(ver 13.0)" ] && echo "rerun without EXL3_CUDA / CUDA_HOME" || echo "update the NVIDIA driver to R580 or newer (CUDA 13), then rerun")"
+  fi
   die "nvcc could not compile a test kernel (above). If it names an unsupported compiler version, install an older g++
   (Debian/Ubuntu: sudo apt install g++-13) and rerun, or set CUDAHOSTCXX=/usr/bin/g++-N"
 fi
