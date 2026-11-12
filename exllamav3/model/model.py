@@ -412,9 +412,22 @@ class Model(Model_TPMixin, Model_LSMixin):
         sh = lm.sparse_head
         flag = params.get("sparse_head") if sh is not None else None
         # params["draft_prob_temp"] (rows,): also export params["draft_prob"], the winner's softmax probability at
-        # that temperature per row (draft_p_min); it needs the whole vocabulary, so the sparse subset is skipped
+        # that temperature per row (draft_p_min). Through the sparse subset it is normalised over the subset: the
+        # columns left out are the rarely produced tokens, so it reads slightly high
         prob_temp = params.get("draft_prob_temp")
-        if flag is True and sh.ready and prob_temp is None:
+        if flag is True and sh.ready and prob_temp is not None:
+            x = lm.prepare_for_device(state, params)
+            shape = x.shape[:-1]
+            sub = sh._transform(sh._logits(x.reshape(-1, x.shape[-1])))
+            conf, idx = torch.max(sub, dim = -1)
+            t = prob_temp.to(sub.device).view(-1, 1).repeat_interleave(sub.shape[0] // prob_temp.numel(), dim = 0)
+            params["draft_prob"] = torch.exp(conf / t.view(-1) - torch.logsumexp(sub / t, dim = -1)).view(shape)
+            if export:
+                params["draft_conf"] = conf.view(shape)
+            if sh.emb_rows is not None:
+                params["draft_embedding"] = sh.emb_rows[idx].view(*shape, -1)
+            return sh.cols[idx].view(shape)
+        if flag is True and sh.ready:
             ids, conf, emb = sh.argmax(lm.prepare_for_device(state, params), embedding = True)
             if export:
                 params["draft_conf"] = conf
