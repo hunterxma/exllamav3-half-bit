@@ -366,7 +366,8 @@ def main(args):
                     qbits_key = r["qbits_key"],
                     numel = r["numel"],
                     S = r["S"],
-                    kld = {k: kld_at(r, k) for k in range(args.min_k, args.max_k + 1)},
+                    kld = {f"{k:g}": kld_at(r, k) for k in
+                           (args.min_k + i * args.k_step for i in range(int(round((args.max_k - args.min_k) / args.k_step)) + 1))},
                 )
                 for r in tensors + head
             ],
