@@ -138,6 +138,15 @@ class ComboSampler(CustomSampler):
 
         super().__init__(stack)
 
+        # Nominal parameters for speculative sampling with sampled drafts (generator/spec_sampling.py): only a
+        # penalty-free, bias-free stochastic stack with a finite top-k support, whose distribution depends on the
+        # logits alone
+        from ..spec_sampling import MAX_K
+        plain = (rep_p == 1.0 and freq_p == 0.0 and pres_p == 0.0 and dry_multiplier == 0.0 and not logit_bias
+                 and adaptive_target == 1.0 and temperature > 0.0 and 1 < top_k <= MAX_K)
+        self.spec_nominal = dict(temperature = temperature, min_p = min_p, top_k = int(top_k), top_p = top_p,
+                                 temp_last = temp_last) if plain else None
+
 class AdaptivePSampler(CustomSampler):
     """
     Min-P followed by Adaptive-P

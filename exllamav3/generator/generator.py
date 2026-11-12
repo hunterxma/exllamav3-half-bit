@@ -16,6 +16,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from . import spec_sampling
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,8 @@ class Generator:
         hybrid_draft_tokens: int = 0,
         draft_max_rows: int = 0,
         sparse_draft_head: int = 0,
+        spec_sampling: bool = False,
+        draft_temperature: float | None = None,
         **kwargs
     ):
         """
@@ -171,6 +174,18 @@ class Generator:
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
+
+        :param spec_sampling:
+            MTP drafting only: sample each draft from the job's own (truncated) sampling distribution and accept it
+            with probability min(1, p/q), resampling from the residual on rejection (generator/spec_sampling.py),
+            instead of drafting the argmax and keeping it when the target's sample matches. The output distribution
+            is unchanged; a drafted token survives with probability 1 - TV(p, q) instead of p(argmax q). Applies to
+            jobs whose sampler is a penalty-free ComboSampler with a top-k support; other jobs draft greedily.
+            Env EXL3_SPEC_SAMPLING=1/0 overrides.
+
+        :param draft_temperature:
+            With spec_sampling: the drafter's sampling temperature as a multiple of the job's (default 1.0); 0 gives
+            greedy drafts under the same exact acceptance rule. Env EXL3_DRAFT_TEMP overrides.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -291,6 +306,11 @@ class Generator:
         self.draft_max_rows = max(0, draft_max_rows or 0)
         self._draft_window_last = None
         self.record_draft_stats = record_draft_stats
+        env = os.environ.get("EXL3_SPEC_SAMPLING")
+        self.spec_sampling = bool(int(env)) if env is not None else spec_sampling
+        env = os.environ.get("EXL3_DRAFT_TEMP")
+        self.draft_temperature = float(env) if env is not None else (1.0 if draft_temperature is None else draft_temperature)
+        self._spec_round = None
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -1271,6 +1291,16 @@ class Generator:
         # of the round; its query position stays at the last accepted token for every step, as the
         # reference implementation drafts
         target_kv = self.draft_model.caps.get("draft_uses_target_cache", False)
+        # Sampled drafts (spec_sampling): every row's sampler must be a plain truncated distribution, in layer-split
+        # mode (the full head's logits are needed, so the sparse head is bypassed); otherwise the round drafts greedily
+        spec = None
+        if self.spec_sampling and not self.model.loaded_tp:
+            jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+            noms = [getattr(job.sampler, "spec_nominal", None) for job in jobs]
+            if all(noms):
+                gen = torch.Generator(device = self.model.modules[self.model.logit_layer_idx].device)
+                gen.manual_seed(jobs[0].rng.randint(0, (1 << 63) - 1))
+                spec = {"nominal": noms, "gen": gen, "q": [[] for _ in jobs]}
         if target_kv:
             kv_seqlens = cache_seqlens.clone()
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
@@ -1283,7 +1313,7 @@ class Generator:
                 "cache": self.cache if target_kv else self.draft_cache,
                 "cache_seqlens": kv_seqlens if target_kv else cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
-                "sparse_head": self._sparse_flag,
+                "sparse_head": self._sparse_flag if spec is None else False,
             }
             if target_kv:
                 params["positions"] = kv_seqlens
@@ -1296,7 +1326,20 @@ class Generator:
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
-            new_ids = self.draft_model.sample_from_state(batch_state, params)
+            if spec is None:
+                new_ids = self.draft_model.sample_from_state(batch_state, params)
+            else:
+                logits = lm_head.forward(batch_state, params)[..., :self.model.config.vocab_size]
+                if cal is not None:
+                    params["draft_conf"] = torch.max(logits, dim = -1).values
+                logits = logits.view(logits.shape[0], -1)
+                cols = []
+                for r, nom in enumerate(spec["nominal"]):
+                    tok, q_ids, q_probs = spec_sampling.sample_draft(
+                        logits[r:r + 1], nom, nom["temperature"] * self.draft_temperature, spec["gen"])
+                    spec["q"][r].append((q_ids.view(-1), q_probs.view(-1)))
+                    cols.append(tok)
+                new_ids = torch.cat(cols, dim = 0)
             draft_cols.append(new_ids)
             draft_emb = params.get("draft_embedding")
             # Without a row from the sparse head, the next step looks the token up in the embedding table,
@@ -1315,6 +1358,7 @@ class Generator:
                     window = idx + 1
                     break
         self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
+        self._spec_round = spec
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1917,6 +1961,18 @@ class Generator:
                 if not batchable:
                     continue
                 job_logits = batch_logits[a:b, :, :]
+                sr = self._spec_round
+                if (sr is not None and draft_tokens is not None and len(sr["q"][r]) == W - 1
+                        and not job.return_probs and job.return_top_tokens == 0):
+                    # Sampled draft: the exact acceptance rule fixes every position's token at once (accepted
+                    # draft, residual sample at the first rejection, plain sample after the last draft)
+                    q = sr["q"][r]
+                    toks = spec_sampling.verify(job_logits[0, :W, :self.model.config.vocab_size], draft_tokens[r, :W - 1],
+                                                [x[0] for x in q], [x[1] for x in q], sr["nominal"][r], sr["gen"])
+                    pinned_w[r, :W].copy_(toks, non_blocking = True)
+                    any_cuda = True
+                    staged_jobs[id(job)] = ([((pinned_w[r:r + 1, i:i + 1], None, None, None), False) for i in range(W)], None)
+                    continue
                 rng_state = job.rng.getstate()
                 staged = []
                 for i in range(W):
@@ -1928,6 +1984,7 @@ class Generator:
                         any_cuda = True
                     staged.append((sampled, False))
                 staged_jobs[id(job)] = (staged, rng_state)
+            self._spec_round = None   # one verification round per drafted window
             if any_cuda:
                 torch.cuda.synchronize(batch_logits.device)
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
@@ -2037,7 +2094,7 @@ class Generator:
                             job.prepare_logit_mask()
                             job.prepare_sampling_past_ids()
 
-                if staged is not None and positions_used < W:
+                if staged is not None and rng_state is not None and positions_used < W:
                     # The serial loop would have drawn one sampler seed per position it reached; pass 1 drew
                     # W. Rewind the job's RNG and replay only the draws that were used, so a seeded stream
                     # continues exactly as it would have on the serial loop

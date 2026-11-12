@@ -473,6 +473,10 @@ class BlockSparseMLP_CPU:
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
         split_k = int(getattr(ip, "moe_cpu_split", 0))
+        # A draft component (MTP head) runs once per drafted token, on the critical path of every round:
+        # EXL3_MOE_CPU_SPLIT_DRAFT sets its own split (0 keeps all its experts on the GPU); default as the text layers
+        if getattr(ip, "moe_cpu_component", "text") != "text" and "EXL3_MOE_CPU_SPLIT_DRAFT" in os.environ:
+            split_k = int(os.environ["EXL3_MOE_CPU_SPLIT_DRAFT"])
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
