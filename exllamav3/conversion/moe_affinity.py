@@ -22,7 +22,7 @@ softmax router the latter barely distinguishes the selected experts from the res
 """
 import torch
 from ..modules.quant.exl3_lib import quantize as exl3_quantize
-from ..modules.quant.exl3_lib.hessian_packed import unpack
+from ..modules.quant.exl3_lib.hessian_packed import unpack, settle_count
 
 EXPERT_BATCH = 16
 ROW_CHUNK = 32768
@@ -65,6 +65,7 @@ def combine_down(capture_H: dict, eps: float):
             continue
         s = float(v.pop("aff_sum"))
         H_aff = v.pop("H_aff")
+        settle_count(v)
         if s <= 0 or v["count"] == 0:
             continue
         v["H"].mul_(eps * s / v["count"]).add_(H_aff)
@@ -98,7 +99,7 @@ def quantize_gate_up(module, linears: list, capture_H: dict, store: dict, quanti
         H_shared = shared["H"].to(device, torch.float)
         if shared.get("packed"):
             H_shared = unpack(H_shared, shared["n"])
-        H_shared /= shared["count"]
+        H_shared /= settle_count(shared)
         p_mean = (st["psum"] / st["rows"]).to(device, torch.float)
         X = torch.cat(st["x"]).to(device)
         S = torch.cat(st["sel"]).to(device)

@@ -1728,13 +1728,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             u = self.ups[e].forward(x, params)
             g = self.gates[e].forward(x, params)
             if sens_weights is not None:
+                # all rows, unrouted ones at weight 0, routed count on the device: no host sync per expert
                 sw = sens_weights[:, e]
-                routed = sw.nonzero().flatten()
-                if routed.numel():
-                    capture_out_sensitivity(
-                        params["capture_sens"], self.gates[e], self.ups[e], self.downs[e],
-                        g[routed], u[routed], self.activation_fn, self.act_limit, sw[routed]
-                    )
+                capture_out_sensitivity(
+                    params["capture_sens"], self.gates[e], self.ups[e], self.downs[e],
+                    g, u, self.activation_fn, self.act_limit, sw, rows = (sw != 0).sum()
+                )
             a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
             self.activation_fn_call(g, u, a, self.act_limit)
             if a.shape[-1] < self.downs[e].in_features:

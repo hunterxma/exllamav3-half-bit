@@ -73,6 +73,7 @@ def capture_out_sensitivity(
     activation_fn: str,
     act_limit: float,
     weights: torch.Tensor | None = None,
+    rows: int | torch.Tensor | None = None,
 ):
     """
     Accumulate, per intermediate channel of a gated MLP, how strongly the MLP's output responds to an error in
@@ -89,12 +90,16 @@ def capture_out_sensitivity(
 
     :param weights:
         optional weight per row (routing weights of a block-sparse MLP)
+
+    :param rows:
+        rows to count (default: all of g). A block-sparse capture passes every row with zero weight on the
+        unrouted ones (they add nothing to the sum) and the routed count as a device tensor, so it never syncs
     """
     n = g.shape[-1]
     slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
     if slopes is None:
         return
-    rows = g.numel() // n
+    rows = g.numel() // n if rows is None else rows
     dn = None
     for linear, c in zip((up, gate), slopes):
         if linear is None or linear.qmap is None:
@@ -112,7 +117,7 @@ def capture_out_sensitivity(
                 "down": dn.to(g.device),
             }
         acc["sum"] += c.double().square().sum(dim = 0)
-        acc["count"] += rows
+        acc["count"] = acc["count"] + rows
 
 
 def merge_out_sensitivity(capture: dict, other: dict):
@@ -123,15 +128,19 @@ def merge_out_sensitivity(capture: dict, other: dict):
         else:
             m = capture[key]
             m["sum"] += acc["sum"].to(m["sum"].device)
-            m["count"] += acc["count"]
+            c = acc["count"]
+            m["count"] = m["count"] + (c.to(m["sum"].device) if torch.is_tensor(c) else c)
 
 
 def finalize_out_sensitivity(capture: dict) -> dict:
     """Per-channel output sensitivity for every captured Linear, keyed by Linear key, on the CPU"""
-    return {
-        key: (acc["sum"] / max(acc["count"], 1) * acc["down"]).float().cpu()
-        for key, acc in capture.items()
-    }
+    # an expert no calibration row was routed to has no entry (count 0), as when such rows were never passed
+    out = {}
+    for key, acc in capture.items():
+        count = int(acc["count"])
+        if count:
+            out[key] = (acc["sum"] / count * acc["down"]).float().cpu()
+    return out
 
 class MLP(Module):
 

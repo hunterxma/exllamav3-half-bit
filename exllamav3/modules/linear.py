@@ -702,17 +702,19 @@ class Linear(Module):
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
-            # Drop the affected rows; the inf_nan counter above still reports them
+            # Drop the affected rows (zeroed: a zero row adds nothing to x^T x) and tally them on the device,
+            # so the capture never waits on the host (settle_count folds the tally into the count); the
+            # inf_nan counter above still reports them
+            hd = params["capture"][self.qmap]
             finite = torch.isfinite(x).all(dim = 1)
             row_w = params.get("capture_row_w")
-            if not finite.all():
-                x = x[finite]
-                rows = x.shape[0]
-                if row_w is not None:
-                    row_w = row_w[finite]
+            x = torch.where(finite.unsqueeze(1), x, torch.zeros((), dtype = x.dtype, device = x.device))
+            hd["dropped"] = hd.get("dropped", 0) + (~finite).sum()
+            if row_w is not None:
+                row_w = torch.where(finite, row_w, torch.zeros((), dtype = row_w.dtype, device = row_w.device))
 
-            accumulate_(params["capture"][self.qmap]["H"], x)
-            params["capture"][self.qmap]["count"] += rows
+            accumulate_(hd["H"], x)
+            hd["count"] += rows
 
             # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
             # conversion/moe_affinity.py), combined with it before quantization. The weights are an
@@ -722,12 +724,11 @@ class Linear(Module):
                 if "H_aff" not in hd:
                     hd["H_aff"] = torch.zeros_like(hd["H"])
                     hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
+                # every row weighted (unrouted rows weigh 0 and add nothing): no host sync to select them
                 row_w = row_w.to(torch.float).clamp_min(0)
-                routed = row_w.nonzero().flatten()
-                if routed.numel():
-                    xw = x[routed] * row_w[routed].sqrt().unsqueeze(1).to(x.dtype)
-                    accumulate_(hd["H_aff"], xw)
-                    hd["aff_sum"] += row_w.sum()
+                xw = x * row_w.sqrt().unsqueeze(1).to(x.dtype)
+                accumulate_(hd["H_aff"], xw)
+                hd["aff_sum"] += row_w.sum()
 
 
     @override

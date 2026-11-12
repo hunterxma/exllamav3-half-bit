@@ -6,7 +6,7 @@ from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
 from ....util.hadamard import get_hadamard_dt
-from .hessian_packed import unpack
+from .hessian_packed import unpack, settle_count
 from ....util import cuda_sync_active
 from ....util.tensor import save_tensor_image
 from functools import lru_cache
@@ -1079,7 +1079,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
         # Mean of samples summed up during forward pass
         # Switch to uncalibrated fallback if no input activations or diagonal is too small (few activations)
-        count = H_data["count"]
+        count = settle_count(H_data)
         if count == 0:
             q_fallback = True
             diag_mean = 0.0

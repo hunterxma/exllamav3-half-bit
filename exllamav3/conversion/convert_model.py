@@ -1195,6 +1195,8 @@ def capture_module_parallel(
                         m["H_aff"] = hd["H_aff"].to(device)
                         m["aff_sum"] = hd["aff_sum"].to(device)
                 m["count"] += hd["count"]
+                if "dropped" in hd:
+                    m["dropped"] = m.get("dropped", 0) + hd["dropped"].to(m["H"].device)
                 m["num_total"] += hd["num_total"]
                 m["inf_nan"] += hd["inf_nan"].to(device)
         cap.clear()

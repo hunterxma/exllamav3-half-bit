@@ -80,6 +80,15 @@ def _syrk_packed_kernel(
     tl.store(out, tl.load(out) + acc)
 
 
+def settle_count(hd: dict):
+    """A capture's row count: capture_H counts every row and tallies the non-finite (dropped) rows on the device
+    so the per-call capture never syncs with the host; fold that tally in once, where the count is used"""
+    d = hd.pop("dropped", None)
+    if d is not None:
+        hd["count"] -= int(d)
+    return hd["count"]
+
+
 def accumulate_(packed: torch.Tensor, x: torch.Tensor):
     """packed += x^T x over the rows of x (T, n), fp32 accumulation. Half/bfloat16 inputs run on the tensor
     cores (their products are exact in fp32); fp32 inputs take the IEEE path"""
