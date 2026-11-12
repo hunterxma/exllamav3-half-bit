@@ -411,7 +411,10 @@ class Model(Model_TPMixin, Model_LSMixin):
         # verification forward can never take it
         sh = lm.sparse_head
         flag = params.get("sparse_head") if sh is not None else None
-        if flag is True and sh.ready:
+        # params["draft_prob_temp"] (rows,): also export params["draft_prob"], the winner's softmax probability at
+        # that temperature per row (draft_p_min); it needs the whole vocabulary, so the sparse subset is skipped
+        prob_temp = params.get("draft_prob_temp")
+        if flag is True and sh.ready and prob_temp is None:
             ids, conf, emb = sh.argmax(lm.prepare_for_device(state, params), embedding = True)
             if export:
                 params["draft_conf"] = conf
@@ -425,6 +428,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             full_ids = torch.argmax(logits, dim = -1)
             sparse_ids, _ = sh.argmax(lm.prepare_for_device(state, params))
             sh.record_probe(full_ids, sparse_ids)
+        if prob_temp is not None:
+            conf, ids = torch.max(logits, dim = -1)
+            t = prob_temp.to(logits.device).view((-1,) + (1,) * (logits.dim() - 2))
+            params["draft_prob"] = torch.exp(conf.float() / t - torch.logsumexp(logits.float() / t.unsqueeze(-1), dim = -1))
+            if export:
+                params["draft_conf"] = conf
+            return ids
         if export:
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf

@@ -138,6 +138,7 @@ def add_args(
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-ssp", "--spec_sampling", action = "store_true", help = "MTP drafting: sample drafts from the job's own sampling distribution and accept with probability min(1, p/q), resampling the residual on rejection. Same output distribution as plain sampling, more drafted tokens kept (penalty-free samplers with top-k)")
         parser.add_argument("-dtemp", "--draft_temperature", type = float, help = "With --spec_sampling: drafter temperature as a multiple of the sampler's (0 = greedy drafts under the exact acceptance rule)", default = 1.0)
+        parser.add_argument("-dpm", "--draft_p_min", type = float, help = "MTP drafting: draft a token only while the drafter's probability for it, at the sampling temperature, is at least this (llama.cpp --spec-draft-p-min); combines with -dds", default = 0.0)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
 
 

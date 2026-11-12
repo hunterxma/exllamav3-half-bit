@@ -96,6 +96,7 @@ def main(args):
         draft_confidence = args.draft_confidence,
         spec_sampling = args.spec_sampling,
         draft_temperature = args.draft_temperature,
+        draft_p_min = args.draft_p_min,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         disk_cache_dir = args.disk_cache_dir,
         disk_cache_size = int(args.disk_cache_size * 1024 ** 3),

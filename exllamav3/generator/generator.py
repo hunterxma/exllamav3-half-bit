@@ -74,6 +74,7 @@ class Generator:
         sparse_draft_head: int = 0,
         spec_sampling: bool = False,
         draft_temperature: float | None = None,
+        draft_p_min: float = 0.0,
         **kwargs
     ):
         """
@@ -186,6 +187,15 @@ class Generator:
         :param draft_temperature:
             With spec_sampling: the drafter's sampling temperature as a multiple of the job's (default 1.0); 0 gives
             greedy drafts under the same exact acceptance rule. Env EXL3_DRAFT_TEMP overrides.
+
+        :param draft_p_min:
+            MTP drafting only, > 0 enables: the drafter's probability for its own pick, at the job's sampling
+            temperature, must reach this for the token to be drafted (llama.cpp --spec-draft-p-min). Drafting stops
+            at the first position below it and that position is not drafted; a round whose first position is below
+            it runs a plain decode step. Unlike dynamic_draft_tokens it needs no probe position per round, so
+            every verified slot is a confident one. With dynamic_draft_tokens as well, both apply: the gate drops
+            unsure positions (the calibrator's probe included) and the calibrator still shortens windows whose
+            running acceptance estimate falls below draft_confidence. Env EXL3_DRAFT_P_MIN overrides.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -310,6 +320,8 @@ class Generator:
         self.spec_sampling = bool(int(env)) if env is not None else spec_sampling
         env = os.environ.get("EXL3_DRAFT_TEMP")
         self.draft_temperature = float(env) if env is not None else (1.0 if draft_temperature is None else draft_temperature)
+        env = os.environ.get("EXL3_DRAFT_P_MIN")
+        self.draft_p_min = float(env) if env is not None else (draft_p_min or 0.0)
         self._spec_round = None
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
@@ -1305,6 +1317,14 @@ class Generator:
             kv_seqlens = cache_seqlens.clone()
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
+        # draft_p_min: each row's pick is scored by its probability at the row's own sampling temperature (1.0 for
+        # greedy or unknown samplers), and drafting stops before the first position where no row reaches p_min
+        prob_temp = None
+        if self.draft_p_min > 0.0 and not self.model.loaded_tp:
+            temps = [getattr(job.sampler, "draft_temperature_hint", None) or 1.0
+                     for job in self.active_jobs if job.is_prefill_done()]
+            prob_temp = torch.tensor(temps, dtype = torch.float,
+                                     device = self.model.modules[self.model.logit_layer_idx].device)
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1321,6 +1341,8 @@ class Generator:
                     params["source_recurrent_states"] = target_states
             if cal is not None:
                 params["export_draft_conf"] = True
+            if prob_temp is not None:
+                params["draft_prob_temp"] = prob_temp
             if draft_emb is not None:
                 params["draft_embedding"] = draft_emb
             batch_state = self.draft_model.forward(batch_ids, params)
@@ -1333,6 +1355,9 @@ class Generator:
                 if cal is not None:
                     params["draft_conf"] = torch.max(logits, dim = -1).values
                 logits = logits.view(logits.shape[0], -1)
+                if prob_temp is not None:
+                    t = prob_temp.view(-1, 1)
+                    params["draft_prob"] = torch.softmax(logits.float() / t, dim = -1).max(dim = -1).values
                 cols = []
                 for r, nom in enumerate(spec["nominal"]):
                     tok, q_ids, q_probs = spec_sampling.sample_draft(
@@ -1340,6 +1365,11 @@ class Generator:
                     spec["q"][r].append((q_ids.view(-1), q_probs.view(-1)))
                     cols.append(tok)
                 new_ids = torch.cat(cols, dim = 0)
+            if prob_temp is not None:
+                dp = params.pop("draft_prob", None)
+                if dp is not None and float(dp.max()) < self.draft_p_min:
+                    window = idx
+                    break
             draft_cols.append(new_ids)
             draft_emb = params.get("draft_embedding")
             # Without a row from the sparse head, the next step looks the token up in the embedding table,
@@ -1357,6 +1387,11 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+        if window == 0:
+            # draft_p_min rejected the first position: a plain decode step (it keeps the MTP state current, as
+            # after a one-token prompt), and the drafter's K/V written at this position is rewritten next round
+            self._spec_round = None
+            return None
         self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
         self._spec_round = spec
 

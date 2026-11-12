@@ -138,6 +138,9 @@ class ComboSampler(CustomSampler):
 
         super().__init__(stack)
 
+        # Sampling temperature the drafter's confidence is scored at (Generator draft_p_min); greedy -> 1.0
+        self.draft_temperature_hint = temperature if temperature > 0.0 and top_k != 1 else 1.0
+
         # Nominal parameters for speculative sampling with sampled drafts (generator/spec_sampling.py): only a
         # penalty-free, bias-free stochastic stack with a finite top-k support, whose distribution depends on the
         # logits alone
