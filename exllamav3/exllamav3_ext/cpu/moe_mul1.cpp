@@ -1965,7 +1965,7 @@ M1_TARGET_AVX2
 M1_ALWAYS_INLINE void avx2_load_planar(const uint16_t* packed,
     __m256i (&preg)[avx2_planar_regs(bits, hb)])
 {
-    static_assert(!hb || (bits >= 1 && bits <= 3), "fractional planar rate");
+    static_assert(!hb || (bits >= 1 && bits <= 7), "fractional planar rate");
     static_assert(tile_u16(bits, hb) == avx2_planar_regs(bits, hb) * (hb ? 8 : 16),
                   "planar loads exactly cover the tile");
     for (int i = 0; i < avx2_planar_regs(bits, hb); ++i)
@@ -2019,7 +2019,7 @@ template <int bits, int row, bool second_word, int half>
 M1_TARGET_AVX2
 M1_ALWAYS_INLINE __m256i avx2_gather_halfword_planar(const __m256i (&preg)[2 * bits + 1])
 {
-    static_assert(bits >= 1 && bits <= 3 && row >= 0 && row < 16 && half >= 0 && half < 2,
+    static_assert(bits >= 1 && bits <= 7 && row >= 0 && row < 16 && half >= 0 && half < 2,
                   "fractional half-row bounds");
     static_assert(halfword_planar_ok<bits, row, half>(), "fractional plane, lane or shift mismatch");
     constexpr int q = rate_k2(bits, true);
@@ -2716,7 +2716,11 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 {
                     case 1: AVX2_HB_SWZ2_ROWS(1)
                     case 2: AVX2_HB_SWZ2_ROWS(2)
-                    default: AVX2_HB_SWZ2_ROWS(3)
+                    case 3: AVX2_HB_SWZ2_ROWS(3)
+                    case 4: AVX2_HB_SWZ2_ROWS(4)
+                    case 5: AVX2_HB_SWZ2_ROWS(5)
+                    case 6: AVX2_HB_SWZ2_ROWS(6)
+                    default: AVX2_HB_SWZ2_ROWS(7)
                 }
                 #undef AVX2_HB_SWZ2_ROWS
             }
@@ -3843,7 +3847,7 @@ int exl3_moe_cpu_swizzle_group(double K)
     if (g_isa == Isa::Avx2)
     {
         if (K == bits && bits >= 1 && bits <= 8) return 2;
-        if (g_fractional_swizzle && K == bits + 0.5 && bits >= 1 && bits <= 3) return 2;
+        if (g_fractional_swizzle && K == bits + 0.5 && bits >= 1 && bits <= 7) return 2;
     }
     return 0;
 }

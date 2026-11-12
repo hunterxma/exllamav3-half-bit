@@ -11,12 +11,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests"))
 from exllamav3.ext import exllamav3_ext as ext
 from testlib.exl3 import rand_experts
+from testlib.moe_cpu import swizzle
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--rates", default = "4,4.5,5,5.5,6,6.5,7,7.5,8"); ap.add_argument("--experts", type = int, default = 104)
 ap.add_argument("--hidden", type = int, default = 2048); ap.add_argument("--inter", type = int, default = 512)
 ap.add_argument("--top_k", type = int, default = 8); ap.add_argument("--tokens", type = int, default = 1)
 ap.add_argument("--threads", type = int, default = 6); ap.add_argument("--runs", type = int, default = 200)
+ap.add_argument("--swizzle", action = "store_true", help = "the tier's packed layout where it has one (as the loader stores it)")
 a = ap.parse_args()
 
 print(f"CPU experts: E={a.experts} H={a.hidden} I={a.inter} tokens={a.tokens} top_k={a.top_k} threads={a.threads}")
@@ -27,8 +29,9 @@ for K in [float(x) for x in a.rates.split(",")]:
     ex = rand_experts(a.experts, a.hidden, a.inter, K, gen)
     lists = []
     for p in ("g", "u", "d"):
-        lists += [[e[0].contiguous() for e in ex[p]], [e[1].contiguous() for e in ex[p]], [e[2].contiguous() for e in ex[p]]]
-    h = ext.exl3_moe_cpu_make_layer(*lists, [], [], [], 0, 0.0, 0)
+        swz = a.swizzle and ext.exl3_moe_cpu_swizzle_group(K) > 0
+        lists += [[swizzle(e[0]) if swz else e[0].contiguous() for e in ex[p]], [e[1].contiguous() for e in ex[p]], [e[2].contiguous() for e in ex[p]]]
+    h = ext.exl3_moe_cpu_make_layer(*lists, [], [], [], 0, 0.0, 1 if swz else 0)
     T, k = a.tokens, min(a.top_k, a.experts)
     x = (torch.randn((T, a.hidden), generator = gen) * 0.05).half()
     w = (torch.rand((T, k), generator = gen) * 0.5 + 0.5).half()
@@ -41,5 +44,5 @@ for K in [float(x) for x in a.rates.split(",")]:
         ext.exl3_moe_cpu_forward(h, x, sels[i % 16].contiguous(), w, out, a.threads)
     dt = (time.perf_counter() - t0) / a.runs
     nb = sum(t.numel() * t.element_size() for p in ("g", "u", "d") for t in [ex[p][0][0]]) * len({int(e) for e in sels[0].flatten()})
-    print(f"{K:>4}   {dt * 1e6:8.1f}   {nb / dt / 1e9:6.1f}")
+    print(f"{K:>4}   {dt * 1e6:8.1f}   {nb / dt / 1e9:6.1f}   {'packed' if swz else 'native'}")
     ext.exl3_moe_cpu_free_layer(h)
