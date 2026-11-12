@@ -95,6 +95,9 @@ _capture_chunk_rows = int(os.environ.get("EXL3_CAPTURE_CHUNK_ROWS", 131072))
 # Output-sensitivity slopes of the routed (expert, row) pairs only (exact: unrouted rows weigh 0); EXL3_SENS_ALL_ROWS=1
 # evaluates every row as before
 _sens_all_rows = os.environ.get("EXL3_SENS_ALL_ROWS", "0") == "1"
+# Hessian capture of a chunk's down projections in one batched accumulation (and the shared gate/up input counted
+# once), instead of ~18 small launches per expert per row; EXL3_CAPTURE_H_BATCHED=0 keeps the per-expert calls
+_capture_h_batched = os.environ.get("EXL3_CAPTURE_H_BATCHED", "1") != "0"
 
 def _expert_mask() -> dict:
     global _expert_mask_cache
@@ -1753,11 +1756,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         T, I = x.shape[0], self.gates[experts[0]].out_features
         # gate/up input: the capture each expert's Linear.forward performs (one accumulation, bookkeeping for the rest)
         if "capture" in params:
-            for e in experts:
-                for lin in (self.ups[e], self.gates[e]):
-                    if lin.qmap and (pass_qmaps is None or lin.qmap in pass_qmaps):
-                        lin.capture_H(x, params)
+            lins = [lin for e in experts for lin in (self.ups[e], self.gates[e])
+                    if lin.qmap and (pass_qmaps is None or lin.qmap in pass_qmaps)]
+            if _capture_h_batched:
+                self._capture_H_shared_input(lins, x, params)
+            else:
+                for lin in lins:
+                    lin.capture_H(x, params)
         chunk = max(1, min(len(experts), _capture_chunk_rows // max(T, 1)))
+        hbase = None
+        if _capture_h_batched and "capture" in params and all(
+                self.downs[e].qmap and (pass_qmaps is None or self.downs[e].qmap in pass_qmaps) for e in experts):
+            hbase = self._capture_H_base([self.downs[e] for e in experts], I, aff_w is not None, params, x.device)
         for c0 in range(0, len(experts), chunk):
             ce = experts[c0 : c0 + chunk]
             wu = torch.stack([self.ups[e].inner.weight for e in ce])
@@ -1774,6 +1784,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 )
             self.activation_fn_call(g.view(-1, I), u.view(-1, I), u.view(-1, I), self.act_limit)   # a overwrites u
             del g
+            if hbase is not None:
+                self._capture_H_down_chunk(hbase, c0, [self.downs[e] for e in ce], u,
+                                           aff_w[:, ce].T if aff_w is not None else None, params)
+                del u
+                continue
             for i, e in enumerate(ce):
                 down = self.downs[e]
                 if down.qmap and (pass_qmaps is None or down.qmap in pass_qmaps):
@@ -1784,6 +1799,101 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     finally:
                         params.pop("capture_row_w", None)
             del u
+
+
+    def _capture_H_shared_input(self, lins, x, params):
+        """
+        Linear.capture_H(x) for many Linears that read the same input (an MLP's gate and up projections): the same
+        H data and counters as calling each in turn, with the inf/NaN count of x taken once. Per qmap, the Linear
+        that owns the accumulation (first_key) runs capture_H; the others only add their bookkeeping
+        """
+        groups = {}
+        for lin in lins:
+            groups.setdefault(lin.qmap, []).append(lin)
+        cap = params["capture"]
+        counts = None
+        for qmap, ls in groups.items():
+            if qmap not in cap:
+                ls[0].capture_H(x, params)   # creates the H data with ls[0] as first_key
+                rest = ls[1:]
+            else:
+                owner = [l for l in ls if l.key == cap[qmap]["first_key"]]
+                for l in owner:
+                    l.capture_H(x, params)
+                rest = [l for l in ls if l.key != cap[qmap]["first_key"]]
+            if rest:
+                if counts is None:
+                    counts = torch.zeros(2, dtype = torch.long, device = x.device)
+                    ext.count_inf_nan(x, counts)
+                hd = cap[qmap]
+                hd["num_total"] += x.numel() * len(rest)
+                hd["inf_nan"] += counts * len(rest)
+
+
+    def _capture_H_base(self, downs, n, weighted, params, dev):
+        """
+        Buffers for the batched down-projection capture of a capture pass: one packed H (and the affinity-weighted
+        H) and the counters for all of downs, with every expert's H data a view of its row. Created on the first
+        calibration row, found again on the next ones; None when the experts' H data were created another way
+        (the per-expert capture then runs)
+        """
+        from .quant.exl3_lib.hessian_packed import packed_numel
+        cap = params["capture"]
+        reg = getattr(self, "_cap_bases", None)
+        if reg is None or reg.get("cap") is not cap:
+            reg = self._cap_bases = {"cap": cap}
+        qmaps = tuple(d.qmap for d in downs)
+        base = reg.get(qmaps)
+        if base is not None:
+            return base
+        if any(q in cap for q in qmaps):
+            return None
+        C = len(downs)
+        base = {
+            "H": torch.zeros((C, packed_numel(n)), dtype = torch.float, device = dev),
+            "inf_nan": torch.zeros((C, 2), dtype = torch.long, device = dev),
+            "dropped": torch.zeros(C, dtype = torch.long, device = dev),
+        }
+        if weighted:
+            base["H_aff"] = torch.zeros_like(base["H"])
+            base["aff_sum"] = torch.zeros(C, dtype = torch.float, device = dev)
+        for i, d in enumerate(downs):
+            assert d.in_features == n
+            hd = d.init_H_data(False)
+            hd.update(H = base["H"][i], packed = True, inf_nan = base["inf_nan"][i], dropped = base["dropped"][i])
+            if weighted:
+                hd.update(H_aff = base["H_aff"][i], aff_sum = base["aff_sum"][i])
+            cap[d.qmap] = hd
+        reg[qmaps] = base
+        return base
+
+
+    def _capture_H_down_chunk(self, base, c0, downs, u, row_w, params):
+        """
+        Linear.capture_H of the down projections downs = experts c0.. of a _capture_H_base (input u[i] (T, n), row
+        weights row_w[i] or None) as batched ops: one packed accumulation (accumulate_batched_, every matrix as
+        accumulate_ computes it), the non-finite row handling and the counters as tensors over the chunk. Same
+        results as the per-expert calls
+        """
+        from .quant.exl3_lib.hessian_packed import accumulate_batched_
+        cap = params["capture"]
+        C, T, n = u.shape
+        sl = slice(c0, c0 + C)
+        for d in downs:
+            hd = cap[d.qmap]
+            hd["num_total"] += T * n
+            hd["count"] += T
+        base["inf_nan"][sl, 0] += torch.isinf(u).sum(dim = (1, 2))
+        base["inf_nan"][sl, 1] += torch.isnan(u).sum(dim = (1, 2))
+        finite = torch.isfinite(u).all(dim = 2)                              # (C, T)
+        u = torch.where(finite.unsqueeze(2), u, torch.zeros((), dtype = u.dtype, device = u.device))
+        base["dropped"][sl] += (~finite).sum(dim = 1)
+        accumulate_batched_(base["H"][sl], u)
+        if row_w is not None:
+            rw = torch.where(finite, row_w, torch.zeros((), dtype = row_w.dtype, device = row_w.device))
+            rw = rw.to(torch.float).clamp_min(0)
+            accumulate_batched_(base["H_aff"][sl], u * rw.sqrt().unsqueeze(2).to(u.dtype))
+            base["aff_sum"][sl] += rw.sum(dim = 1)
 
 
     def _capture_all_experts(self, y, selected_experts, sens_weights, aff_w, params):

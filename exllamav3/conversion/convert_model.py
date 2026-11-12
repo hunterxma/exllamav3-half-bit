@@ -1683,7 +1683,17 @@ def main(args, job_state):
                         aff_store = merge_affinity_stores(aff_stores)
                         aff_stores = None
                     phase_profiler_done(prof)
+                    # batched capture buffers live on as the H data's views; drop the modules' registry of them
+                    for m in module:
+                        if hasattr(m, "_cap_bases"):
+                            del m._cap_bases
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
+                    # EXL3_EXIT_AFTER_CAPTURE=<module idx>: a capture-only timing slice (tests); stop here
+                    if os.environ.get("EXL3_EXIT_AFTER_CAPTURE", "") == str(idx):
+                        print(f" -- Phases: load {time.time() - start_module_time - (time.time() - t_phase):.1f} s  "
+                              f"capture {time.time() - t_phase:.1f} s", flush = True)
+                        print(" -- EXL3_EXIT_AFTER_CAPTURE reached, stopping job", flush = True)
+                        sys.exit()
 
                     # More feedback
                     if len(capture_H):
@@ -1747,7 +1757,8 @@ def main(args, job_state):
 
             # Collect converted module tensors
             for m in module:
-                if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16:
+                if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16 and \
+                        not os.environ.get("EXL3_EXIT_AFTER_CAPTURE"):
                     tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
                     print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
                     q_tensors.update(tensors)

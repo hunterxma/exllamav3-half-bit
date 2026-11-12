@@ -139,8 +139,7 @@ def capture_out_sensitivity_batched(
 
     max_routed: an upper bound on the routed (expert, row) pairs, e.g. top-k x T. With it only those rows are
     evaluated (an unrouted row has weight 0 and adds exactly nothing), about k / num_experts of the work, gathered
-    with a fixed-size nonzero (no host sync) and summed per expert by a prefix sum over the expert-major rows
-    (deterministic)
+    with a fixed-size nonzero (no host sync) and summed per expert in fp64
     """
     C, T, n = g.shape
     rows = (weights != 0).sum(dim = 1)
@@ -152,11 +151,11 @@ def capture_out_sensitivity_batched(
         idx = idx.clamp(max = C * T - 1)
         wv = (flat.index_select(0, idx).float() * valid).reshape(-1, 1)
         slopes = gated_act_slopes(activation_fn, g.reshape(-1, n).index_select(0, idx), u.reshape(-1, n).index_select(0, idx), act_limit)
-        off = rows.cumsum(0)
-        prev = off - rows
+        expert = torch.div(idx, T, rounding_mode = "floor")     # padding rows (weight 0) land on the last expert
         def per_expert(c):
-            cs = torch.cat((torch.zeros((1, n), dtype = torch.double, device = c.device), c.double().square().cumsum(0)))
-            return cs.index_select(0, off) - cs.index_select(0, prev)   # (C, n)
+            # fp64 sums per expert (index_add_ is 7x faster than an fp64 prefix sum here; its atomic order moves
+            # the fp64 sums by ~1e-13 relative, below the fp32 the scales are used in)
+            return torch.zeros((C, n), dtype = torch.double, device = c.device).index_add_(0, expert, c.double().square())
     else:
         slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
         wv = weights.float().reshape(-1, 1)

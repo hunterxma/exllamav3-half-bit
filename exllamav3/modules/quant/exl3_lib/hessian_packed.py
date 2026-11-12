@@ -37,9 +37,14 @@ _NUM_STAGES = 3
 def _syrk_packed_kernel(
     x_ptr, out_ptr, T, n, nb, stride_t,
     B: tl.constexpr, BK: tl.constexpr, FLUSH: tl.constexpr, IEEE: tl.constexpr,
+    stride_xc = 0, stride_oc = 0,
 ):
-    # One program per upper-triangular block pair, enumerated row-major over the packed index
+    # One program per upper-triangular block pair, enumerated row-major over the packed index; program_id(1)
+    # selects the matrix of a batch (accumulate_batched_), each computed exactly as a single call would
     pid = tl.program_id(0)
+    c = tl.program_id(1).to(tl.int64)
+    x_ptr += c * stride_xc
+    out_ptr += c * stride_oc
     bi = 0
     base = 0
     for r in range(0, nb):
@@ -105,6 +110,27 @@ def accumulate_(packed: torch.Tensor, x: torch.Tensor):
         _syrk_packed_kernel[(num_blocks(n),)](
             x, packed, T, n, -(-n // PACK_BLOCK), x.stride(0),
             B = PACK_BLOCK, BK = _BK, FLUSH = _FLUSH, IEEE = x.dtype == torch.float,
+            num_warps = _NUM_WARPS, num_stages = _NUM_STAGES,
+        )
+
+
+def accumulate_batched_(packed: torch.Tensor, x: torch.Tensor):
+    """packed[c] += x[c]^T x[c] for a batch: packed (C, packed_numel(n)) fp32, x (C, T, n). One launch; every
+    matrix is accumulated exactly as accumulate_(packed[c], x[c]) would"""
+    assert x.dim() == 3 and packed.dim() == 2 and packed.dtype == torch.float and packed.is_cuda
+    C, T, n = x.shape
+    assert packed.shape == (C, packed_numel(n)) and packed.stride(1) == 1, "packed Hessian batch"
+    if x.dtype not in (torch.half, torch.bfloat16, torch.float):
+        x = x.float()
+    if x.stride(2) != 1:
+        x = x.contiguous()
+    if T == 0 or C == 0:
+        return
+    with torch.cuda.device(packed.device):
+        _syrk_packed_kernel[(num_blocks(n), C)](
+            x, packed, T, n, -(-n // PACK_BLOCK), x.stride(1),
+            B = PACK_BLOCK, BK = _BK, FLUSH = _FLUSH, IEEE = x.dtype == torch.float,
+            stride_xc = x.stride(0), stride_oc = packed.stride(0),
             num_warps = _NUM_WARPS, num_stages = _NUM_STAGES,
         )
 
