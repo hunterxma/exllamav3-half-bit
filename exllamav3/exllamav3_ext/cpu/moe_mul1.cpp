@@ -2157,6 +2157,19 @@ M1_ALWAYS_INLINE void avx2_rows_accum_planar(
 //
 // tn0/tn1 are always even: assign_gemvs splits in 8-tile groups (2-tile aligned) and
 // tiles_n is a multiple of 8. There is no per-tile edge handling.
+// Software prefetch for the band-2 + planar loops (avx2_swz2, avx2_swz2_pair): a tile pair's trellis words are
+// contiguous along k, so the loop streams one expert matrix front to back; touching AVX2_SWZ2_PF steps ahead keeps
+// more DRAM misses in flight (cold experts come from DRAM). Measured on Zen 2 (3600, 6 threads, Qwen3.6 expert
+// shape, science/moe_cpu_kernel_ab.py, bit-exact): 12 steps 1.03x at 4-5 bpw, 1.09x at 6; 4 / 24 / 32 / NTA lower
+#ifndef AVX2_SWZ2_PF
+#define AVX2_SWZ2_PF 12
+#endif
+M1_ALWAYS_INLINE void avx2_swz2_prefetch(const uint16_t* p, size_t step)
+{
+    const char* pf = reinterpret_cast<const char*>(p + AVX2_SWZ2_PF * step);
+    for (size_t o = 0; o < step * sizeof(uint16_t); o += 64) _mm_prefetch(pf + o, _MM_HINT_T0);
+}
+
 template <int bits, int Rows = MAX_M, bool hb = false>
 M1_TARGET_AVX2
 void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
@@ -2182,6 +2195,7 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         const uint16_t* pB = pA + packed_size;
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
         {
+            avx2_swz2_prefetch(pA, step);
             const int32_t* dup = splat_dup + tile_k * 16;
             __m256i preg[avx2_planar_regs(bits, hb)];
             avx2_load_planar<bits, hb>(pA, preg);
@@ -2320,6 +2334,7 @@ void avx2_swz2_pair(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, 
         const uint16_t* pB = pA + packed_size;
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
         {
+            avx2_swz2_prefetch(pA, step);
             const int32_t* px = in.splat_pair + tile_k * 8;
             __m256i preg[avx2_planar_regs(bits, hb)];
             avx2_load_planar<bits, hb>(pA, preg);
