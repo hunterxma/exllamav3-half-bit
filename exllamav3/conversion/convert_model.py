@@ -868,6 +868,55 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         t.join(timeout = 0.1)
 
 
+_reuse = None
+
+
+def reuse_linears(linears, strategy):
+    """
+    EXL3_CONVERT_REUSE=<EXL3 model dir> (same model, codebook and flags): a linear whose recipe rate equals the rate
+    stored in that model takes its tensors (trellis, suh, svh, codebook marker) instead of being quantized, and the
+    forward pass that feeds the next layer uses them. For a recipe that changes a few groups of an existing build
+    (e.g. a bitrate tier of the cold experts), only the changed tensors are quantized. The reused tensors were quantized
+    against the old build's calibration stream; they are the same tensors a hybrid of the two builds would take.
+    Returns the linears left to quantize.
+    """
+    global _reuse
+    root = os.environ.get("EXL3_CONVERT_REUSE")
+    if not root:
+        return linears
+    if _reuse is None:
+        wm = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
+        _reuse = {"wm": wm, "h": {}}
+    wm, handles = _reuse["wm"], _reuse["h"]
+    def get(k, device):
+        f = wm.get(k)
+        if f is None:
+            return None
+        if f not in handles:
+            handles[f] = safe_open(os.path.join(root, f), framework = "pt", device = "cpu")
+        return handles[f].get_tensor(k).to(device)
+    keep, n = [], 0
+    for l in linears:
+        k = l.key
+        if k + ".trellis" not in wm or k + ".mul1" not in wm:
+            keep.append(l)
+            continue
+        trellis = get(k + ".trellis", l.device)
+        if trellis.shape[-1] / 16 != float(strategy[k]):
+            keep.append(l)
+            continue
+        bias = l.inner.get_bias_tensor()
+        l.inner = LinearEXL3(
+            l.config, l.in_features, l.out_features, None, None, None,
+            get(k + ".suh", l.device), get(k + ".svh", l.device), trellis, None, get(k + ".mul1", "cpu"),
+            bias, l.out_dtype, key = k
+        )
+        n += 1
+    if n:
+        print(f" -- Reused {n} linears from {root} (rate unchanged), quantizing {len(keep)}")
+    return keep
+
+
 def phase_profiler(phase: str, idx: int):
     """
     EXL3_PROFILE_<phase>=<module idx>:<file> (phase CAPTURE or QUANT): a started torch.profiler over that phase of
@@ -1753,6 +1802,7 @@ def main(args, job_state):
                     quantize_linears_single(
                         args, linears_, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H_, state, out_sens)
 
+            linears = reuse_linears(linears, strategy)
             prof = phase_profiler("QUANT", idx)
 
             # Gate/up projections of experts with affinity-weighted Hessians: per expert, a few at a time
