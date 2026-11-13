@@ -259,6 +259,9 @@ def prepare(args) -> (dict, dict, bool, str):
         bad = [k for k, v in recipe_tensors.items() if not ok(v)]
         if bad:
             return None, None, False, f"Recipe bitrates must be integers 1-8, 16, or one of {HALF_RATES}; bad keys e.g.: {bad[:5]}"
+        # Whole rates written as floats (YAML "8.0") would reach the integer trellis kernels as a float K, which
+        # their bindings reject; store them as ints
+        recipe_tensors = {k: int(v) if float(v).is_integer() else float(v) for k, v in recipe_tensors.items()}
         recipe_bits = recipe.get("achieved_bpw") or recipe.get("target_bpw")
         if args.bits is None and recipe_bits is None:
             return None, None, False, "Recipe has no target_bpw/achieved_bpw; pass --bits for reporting"
