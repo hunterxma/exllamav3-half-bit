@@ -830,6 +830,25 @@ class BlockSparseMLP_CPU:
         """
         stc = self.config.stc
         cpu = torch.device("cpu")
+
+        # Bitrate tiers: a build may store a layer's experts at two rates (e.g. the experts the CPU
+        # worker serves one bit lower: fewer DDR4 bytes per token). The GPU kernels and the worker
+        # each take one rate per projection, so the low-rate experts ARE the tail: the split becomes
+        # their count, they sort last, and swapping stays off (a swap copies trellis bytes as is)
+        def rates(e):
+            return tuple(stc.list_tensors(l.key)[l.key + ".trellis"]["shape"][-1]
+                         for l in (([self.gates[e]] if self.gated else []) + [self.ups[e], self.downs[e]]))
+        er = [rates(e) for e in range(self.num_experts)]
+        tiers = sorted(set(er), key = lambda r: -sum(r))
+        self._split_low = None
+        if len(tiers) > 1:
+            if len(tiers) != 2:
+                raise ValueError(f"{self.key}: {len(tiers)} expert bitrate tiers, the CPU split supports two")
+            self._split_low = [r == tiers[1] for r in er]
+            n_low = sum(self._split_low)
+            if split_k != n_low:
+                print(f" -- {self.key}: {n_low} low-rate experts form the CPU tail (split {split_k} -> {n_low})")
+                split_k = n_low
         first = self.num_experts - split_k
 
         # Same eligibility probes as the whole-layer path, on the tail experts
@@ -871,7 +890,7 @@ class BlockSparseMLP_CPU:
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
+            and not self.tid2eid_key and self._split_low is None
         # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 4, 0 off): with
         # the pinned arena the parent moves experts between the GPU slots and the worker's arena
         # by DMA, so a routed expert the CPU had to compute can take a spare GPU slot for the
@@ -900,8 +919,11 @@ class BlockSparseMLP_CPU:
                     print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
             else:
                 counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
+        if self._split_low is not None and (counts is None or len(counts) != self.num_experts):
+            counts = [0] * self.num_experts
         if counts is not None and len(counts) == self.num_experts:
-            perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
+            low = self._split_low or [False] * self.num_experts
+            perm = sorted(range(self.num_experts), key = lambda e: (low[e], -counts[e]))
             self._split_perm = perm
             if self.gated:
                 self.gates = [self.gates[e] for e in perm]
