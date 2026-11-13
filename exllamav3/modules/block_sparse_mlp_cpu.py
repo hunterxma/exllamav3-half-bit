@@ -831,23 +831,26 @@ class BlockSparseMLP_CPU:
         stc = self.config.stc
         cpu = torch.device("cpu")
 
-        # Bitrate tiers: a build may store a layer's experts at two rates (e.g. the experts the CPU
-        # worker serves one bit lower: fewer DDR4 bytes per token). The GPU kernels and the worker
+        # Bitrate tiers: a build may store a layer's experts at two rates (the experts the CPU worker
+        # serves at their own rate). The GPU kernels and the worker
         # each take one rate per projection, so the low-rate experts ARE the tail: the split becomes
         # their count, they sort last, and swapping stays off (a swap copies trellis bytes as is)
         def rates(e):
             return tuple(stc.list_tensors(l.key)[l.key + ".trellis"]["shape"][-1]
                          for l in (([self.gates[e]] if self.gated else []) + [self.ups[e], self.downs[e]]))
         er = [rates(e) for e in range(self.num_experts)]
-        tiers = sorted(set(er), key = lambda r: -sum(r))
+        # The tail is the smaller group (a tier marks the cold experts, fewer than the hot ones), ties to the lower
+        # rate: a build may store the CPU-served experts lower (fewer bytes) or higher (the CPU kernels run half
+        # rates no faster than the next integer rate, so 4.5 -> 5 there is accuracy for free)
+        tiers = sorted(set(er), key = lambda r: (sum(1 for x in er if x == r), sum(r)))
         self._split_low = None
         if len(tiers) > 1:
             if len(tiers) != 2:
                 raise ValueError(f"{self.key}: {len(tiers)} expert bitrate tiers, the CPU split supports two")
-            self._split_low = [r == tiers[1] for r in er]
+            self._split_low = [r == tiers[0] for r in er]
             n_low = sum(self._split_low)
             if split_k != n_low:
-                print(f" -- {self.key}: {n_low} low-rate experts form the CPU tail (split {split_k} -> {n_low})")
+                print(f" -- {self.key}: {n_low} tier experts form the CPU tail (split {split_k} -> {n_low})")
                 split_k = n_low
         first = self.num_experts - split_k
 
