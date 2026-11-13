@@ -52,6 +52,20 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 EXPERT_STATS_DIR = None
 
 
+_split_map = None
+
+
+def _split_map_load():
+    """EXL3_MOE_CPU_SPLIT_MAP: {module key: CPU tail experts} (read once)"""
+    global _split_map
+    if _split_map is None:
+        import json
+        with open(os.environ["EXL3_MOE_CPU_SPLIT_MAP"]) as f:
+            d = json.load(f)
+        _split_map = {k: int(v) for k, v in d.get("split", d).items()}
+    return _split_map
+
+
 def _expert_stats_path(config, num_experts):
     """Per-model file for the routed-expert frequencies the dynamic placement collects, keyed on
     the model directory and the expert count (a stale or foreign profile only costs what the
@@ -482,6 +496,11 @@ class BlockSparseMLP_CPU:
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
                 "a slice of every eligible layer's experts, whole-layer offload takes entire " \
                 "layers — pick one"
+        # Per-layer split (EXL3_MOE_CPU_SPLIT_MAP = json {module key: tail experts}, e.g. from
+        # science/split_map.py): layers whose cold tail still carries traffic keep more experts on
+        # the GPU, layers whose tail is idle offload more, at the same VRAM. Unlisted layers keep split_k
+        if getattr(ip, "moe_cpu_component", "text") == "text" and os.environ.get("EXL3_MOE_CPU_SPLIT_MAP"):
+            split_k = int(_split_map_load().get(self.key, split_k))
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
