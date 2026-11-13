@@ -558,6 +558,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
         )
+        # Experts at two bitrates in one projection (a CPU-tail tier, see block_sparse_mlp_cpu) cannot share a
+        # MultiLinear (one K per projection); loaded whole (the converter's forward, no CPU split) the layer runs the
+        # dense per-expert path, each expert at its own rate. With the split, each side is uniform again
+        def _uniform_k(ls):
+            return len({getattr(l.inner, "K", None) for l in ls}) <= 1
+        self.mixed_rates = self.is_quantized and not (
+            _uniform_k(self.gates) and _uniform_k(self.ups) and _uniform_k(self.downs))
+        if self.mixed_rates:
+            self.support_quant_paths = False
 
         # The fused bsz<=MAX_BSZN kernels (BC_BlockSparseMLP.run_bszN) additionally support
         # the gpt-oss activation, per-expert biases (all-or-nothing per projection) and padded
@@ -567,7 +576,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            self.is_quantized and
+            self.is_quantized and not self.mixed_rates and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
