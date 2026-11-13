@@ -869,6 +869,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
 
 _reuse = None
+from safetensors import safe_open as _st_safe_open   # header slices for the reuse checks (safetensors_alt has none)
 
 
 def reuse_linears(linears, strategy):
@@ -893,7 +894,7 @@ def reuse_linears(linears, strategy):
         if f is None:
             return None
         if f not in handles:
-            handles[f] = safe_open(os.path.join(root, f), framework = "pt", device = "cpu")
+            handles[f] = _st_safe_open(os.path.join(root, f), framework = "pt", device = "cpu")
         return handles[f].get_tensor(k).to(device)
     keep, n = [], 0
     for l in linears:
@@ -915,6 +916,39 @@ def reuse_linears(linears, strategy):
     if n:
         print(f" -- Reused {n} linears from {root} (rate unchanged), quantizing {len(keep)}")
     return keep
+
+
+def _reuse_rate(k):
+    """Stored rate of linear k in the EXL3_CONVERT_REUSE build (None: not there / no codebook marker)"""
+    global _reuse
+    root = os.environ["EXL3_CONVERT_REUSE"]
+    if _reuse is None:
+        _reuse = {"wm": json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"], "h": {}}
+    wm, handles = _reuse["wm"], _reuse["h"]
+    if k + ".trellis" not in wm or k + ".mul1" not in wm:
+        return None
+    f = wm[k + ".trellis"]
+    if f not in handles:
+        handles[f] = _st_safe_open(os.path.join(root, f), framework = "pt", device = "cpu")
+    return handles[f].get_slice(k + ".trellis").get_shape()[-1] / 16
+
+
+def mark_reused_experts(module, strategy):
+    """With EXL3_CONVERT_REUSE: block-sparse experts whose gate, up and down all keep their stored rate are reused,
+    so the all-experts calibration capture skips them (capture_skip_experts)"""
+    if not os.environ.get("EXL3_CONVERT_REUSE"):
+        return
+    for m in module:
+        if not hasattr(m, "downs") or not hasattr(m, "ups"):
+            continue
+        skip = set()
+        for e in range(len(m.downs)):
+            lins = ([m.gates[e]] if getattr(m, "gated", False) else []) + [m.ups[e], m.downs[e]]
+            if all(l.key in strategy and _reuse_rate(l.key) == float(strategy[l.key]) for l in lins):
+                skip.add(e)
+        m.capture_skip_experts = skip
+        if skip:
+            print(f" -- {m.key}: {len(skip)} of {len(m.downs)} experts reused, capture skips them")
 
 
 def phase_profiler(phase: str, idx: int):
@@ -1645,6 +1679,7 @@ def main(args, job_state):
 
             aff_store = None
             phase_t["load"] = phase_t.get("load", 0) + time.time() - t_phase; t_phase = time.time()
+            mark_reused_experts(module, strategy)
 
             # Skip modules without quant targets
             qmaps = module.get_qmaps()

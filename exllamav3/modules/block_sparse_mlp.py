@@ -1932,6 +1932,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         """
         x = y if y.dtype == torch.half else y.half()
         experts = selected_experts[0].tolist()
+        # Experts the converter will not quantize (EXL3_CONVERT_REUSE takes their tensors from an existing build)
+        # need no statistics: convert_model sets capture_skip_experts
+        skip = getattr(self, "capture_skip_experts", None)
+        if skip:
+            experts = [e for e in experts if e not in skip]
+            if not experts:
+                return
         x2 = x.view(-1, x.shape[-1])
         if self._capture_batch_ok(experts, x2):
             return self._capture_all_experts_batched(x2, experts, sens_weights, aff_w, params)
