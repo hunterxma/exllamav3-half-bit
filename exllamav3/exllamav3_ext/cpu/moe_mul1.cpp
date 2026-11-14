@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -2487,235 +2488,66 @@ const bool g_fractional_swizzle = []{
 
 // ks (split-K slice, see KSlice): VBMI tier only and never K8, which that tier routes to the VNNI
 // kernels; decode_phase checks split_k_ok first
+// AVX-512 tiers: one kernel instantiation per (bits, half rate, rows) -- whole rates 1-8, half rates 1.5-7.5 (bits 1-7
+// with hb), 1-4 rows -- taken from a compile-time table; other combinations do nothing. The AVX2 tier below keeps its
+// own dispatch (layout- and compiler-dependent row specializations)
+using TilesFn = void (*)(const MoeCpuMatrix&, const PreparedIn&, float*, int, int, const KSlice*);
+
+struct VbmiTiles
+{
+    template <int b, bool hb, int r>
+    static void run(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1, const KSlice* ks)
+    {
+        // K8: byte pairing impossible (shift % 8 == 0) and the byte windows straddle the register pairs -- measured
+        // slower than the dword scheme, so it takes the VNNI kernel
+        if constexpr (b == 8) vnni_tiles<8, false, r>(mat, in, tout, tn0, tn1);
+        else vbmi_tiles<b, hb, r>(mat, in, tout, tn0, tn1, ks);
+    }
+};
+
+struct VnniTiles
+{
+    template <int b, bool hb, int r>
+    static void run(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1, const KSlice*)
+    { vnni_tiles<b, hb, r>(mat, in, tout, tn0, tn1); }
+};
+
+struct BwTiles
+{
+    template <int b, bool hb, int r>
+    static void run(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1, const KSlice*)
+    { bw_tiles_any<b, hb, r>(mat, in, tout, tn0, tn1); }
+};
+
+template <class K, bool hb, int... I>
+inline void tiles_index(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int i, int tn0, int tn1,
+                        const KSlice* ks, std::integer_sequence<int, I...>)
+{
+    static constexpr TilesFn table[] = { &K::template run<I / 4 + 1, hb, I % 4 + 1>... };
+    table[i](mat, in, tout, tn0, tn1, ks);
+}
+
+template <class K>
+inline void tiles_table(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1,
+                        const KSlice* ks)
+{
+    if (m < 1 || m > MAX_M || mat.bits < 1) return;
+    const int i = (mat.bits - 1) * 4 + m - 1;
+    if (mat.hb)
+    {
+        if (mat.bits <= 7) tiles_index<K, true>(mat, in, tout, i, tn0, tn1, ks, std::make_integer_sequence<int, 28>{});
+    }
+    else if (mat.bits <= 8) tiles_index<K, false>(mat, in, tout, i, tn0, tn1, ks, std::make_integer_sequence<int, 32>{});
+}
+
 void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1,
                const KSlice* ks = nullptr)
 {
     if (tn0 >= tn1) return;
     switch (g_isa) {
-        case Isa::Vbmi:
-        {
-            if (mat.hb)
-            {
-                switch (mat.bits * 4 + m - 1)
-                {
-                    case 1 * 4 + 0: vbmi_tiles<1, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 1 * 4 + 1: vbmi_tiles<1, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 1 * 4 + 2: vbmi_tiles<1, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 1 * 4 + 3: vbmi_tiles<1, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 2 * 4 + 0: vbmi_tiles<2, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 2 * 4 + 1: vbmi_tiles<2, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 2 * 4 + 2: vbmi_tiles<2, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 2 * 4 + 3: vbmi_tiles<2, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 3 * 4 + 0: vbmi_tiles<3, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 3 * 4 + 1: vbmi_tiles<3, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 3 * 4 + 2: vbmi_tiles<3, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 3 * 4 + 3: vbmi_tiles<3, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 4 * 4 + 0: vbmi_tiles<4, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 4 * 4 + 1: vbmi_tiles<4, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 4 * 4 + 2: vbmi_tiles<4, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 4 * 4 + 3: vbmi_tiles<4, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 5 * 4 + 0: vbmi_tiles<5, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 5 * 4 + 1: vbmi_tiles<5, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 5 * 4 + 2: vbmi_tiles<5, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 5 * 4 + 3: vbmi_tiles<5, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 6 * 4 + 0: vbmi_tiles<6, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 6 * 4 + 1: vbmi_tiles<6, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 6 * 4 + 2: vbmi_tiles<6, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 6 * 4 + 3: vbmi_tiles<6, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                    case 7 * 4 + 0: vbmi_tiles<7, true, 1>(mat, in, tout, tn0, tn1, ks); return;
-                    case 7 * 4 + 1: vbmi_tiles<7, true, 2>(mat, in, tout, tn0, tn1, ks); return;
-                    case 7 * 4 + 2: vbmi_tiles<7, true, 3>(mat, in, tout, tn0, tn1, ks); return;
-                    case 7 * 4 + 3: vbmi_tiles<7, true, 4>(mat, in, tout, tn0, tn1, ks); return;
-                }
-                return;
-            }
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: vbmi_tiles<1, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 1 * 4 + 1: vbmi_tiles<1, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 1 * 4 + 2: vbmi_tiles<1, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 1 * 4 + 3: vbmi_tiles<1, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 2 * 4 + 0: vbmi_tiles<2, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 2 * 4 + 1: vbmi_tiles<2, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 2 * 4 + 2: vbmi_tiles<2, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 2 * 4 + 3: vbmi_tiles<2, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 3 * 4 + 0: vbmi_tiles<3, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 3 * 4 + 1: vbmi_tiles<3, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 3 * 4 + 2: vbmi_tiles<3, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 3 * 4 + 3: vbmi_tiles<3, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 4 * 4 + 0: vbmi_tiles<4, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 4 * 4 + 1: vbmi_tiles<4, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 4 * 4 + 2: vbmi_tiles<4, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 4 * 4 + 3: vbmi_tiles<4, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 5 * 4 + 0: vbmi_tiles<5, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 5 * 4 + 1: vbmi_tiles<5, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 5 * 4 + 2: vbmi_tiles<5, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 5 * 4 + 3: vbmi_tiles<5, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 6 * 4 + 0: vbmi_tiles<6, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 6 * 4 + 1: vbmi_tiles<6, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 6 * 4 + 2: vbmi_tiles<6, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 6 * 4 + 3: vbmi_tiles<6, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                case 7 * 4 + 0: vbmi_tiles<7, false, 1>(mat, in, tout, tn0, tn1, ks); return;
-                case 7 * 4 + 1: vbmi_tiles<7, false, 2>(mat, in, tout, tn0, tn1, ks); return;
-                case 7 * 4 + 2: vbmi_tiles<7, false, 3>(mat, in, tout, tn0, tn1, ks); return;
-                case 7 * 4 + 3: vbmi_tiles<7, false, 4>(mat, in, tout, tn0, tn1, ks); return;
-                // K8: byte pairing impossible (shift % 8 == 0) and the byte windows straddle
-                // the register pairs -- measured slower than the dword scheme, so route there
-                case 8 * 4 + 0: vnni_tiles<8, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: vnni_tiles<8, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: vnni_tiles<8, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: vnni_tiles<8, false, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
-        }
-        case Isa::Vnni:
-        {
-            if (mat.hb)
-            {
-                switch (mat.bits * 4 + m - 1)
-                {
-                    case 1 * 4 + 0: vnni_tiles<1, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 1: vnni_tiles<1, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 2: vnni_tiles<1, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 3: vnni_tiles<1, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 0: vnni_tiles<2, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 1: vnni_tiles<2, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 2: vnni_tiles<2, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 3: vnni_tiles<2, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 0: vnni_tiles<3, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 1: vnni_tiles<3, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 2: vnni_tiles<3, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 3: vnni_tiles<3, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 0: vnni_tiles<4, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 1: vnni_tiles<4, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 2: vnni_tiles<4, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 3: vnni_tiles<4, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 0: vnni_tiles<5, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 1: vnni_tiles<5, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 2: vnni_tiles<5, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 3: vnni_tiles<5, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 0: vnni_tiles<6, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 1: vnni_tiles<6, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 2: vnni_tiles<6, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 3: vnni_tiles<6, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 0: vnni_tiles<7, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 1: vnni_tiles<7, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 2: vnni_tiles<7, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 3: vnni_tiles<7, true, 4>(mat, in, tout, tn0, tn1); return;
-                }
-                return;
-            }
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: vnni_tiles<1, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: vnni_tiles<1, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: vnni_tiles<1, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: vnni_tiles<1, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: vnni_tiles<2, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: vnni_tiles<2, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: vnni_tiles<2, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: vnni_tiles<2, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: vnni_tiles<3, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: vnni_tiles<3, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: vnni_tiles<3, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: vnni_tiles<3, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: vnni_tiles<4, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: vnni_tiles<4, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: vnni_tiles<4, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: vnni_tiles<4, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: vnni_tiles<5, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: vnni_tiles<5, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: vnni_tiles<5, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: vnni_tiles<5, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: vnni_tiles<6, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: vnni_tiles<6, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: vnni_tiles<6, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: vnni_tiles<6, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: vnni_tiles<7, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: vnni_tiles<7, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: vnni_tiles<7, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: vnni_tiles<7, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 0: vnni_tiles<8, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: vnni_tiles<8, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: vnni_tiles<8, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: vnni_tiles<8, false, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
-        }
-        case Isa::Bw:
-        {
-            if (mat.hb)
-            {
-                switch (mat.bits * 4 + m - 1)
-                {
-                    case 1 * 4 + 0: bw_tiles_any<1, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 1: bw_tiles_any<1, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 2: bw_tiles_any<1, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 3: bw_tiles_any<1, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 0: bw_tiles_any<2, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 1: bw_tiles_any<2, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 2: bw_tiles_any<2, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 3: bw_tiles_any<2, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 0: bw_tiles_any<3, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 1: bw_tiles_any<3, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 2: bw_tiles_any<3, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 3: bw_tiles_any<3, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 0: bw_tiles_any<4, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 1: bw_tiles_any<4, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 2: bw_tiles_any<4, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 4 * 4 + 3: bw_tiles_any<4, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 0: bw_tiles_any<5, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 1: bw_tiles_any<5, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 2: bw_tiles_any<5, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 5 * 4 + 3: bw_tiles_any<5, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 0: bw_tiles_any<6, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 1: bw_tiles_any<6, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 2: bw_tiles_any<6, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 6 * 4 + 3: bw_tiles_any<6, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 0: bw_tiles_any<7, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 1: bw_tiles_any<7, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 2: bw_tiles_any<7, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 7 * 4 + 3: bw_tiles_any<7, true, 4>(mat, in, tout, tn0, tn1); return;
-                }
-                return;
-            }
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: bw_tiles_any<1, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: bw_tiles_any<1, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: bw_tiles_any<1, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: bw_tiles_any<1, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: bw_tiles_any<2, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: bw_tiles_any<2, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: bw_tiles_any<2, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: bw_tiles_any<2, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: bw_tiles_any<3, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: bw_tiles_any<3, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: bw_tiles_any<3, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: bw_tiles_any<3, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: bw_tiles_any<4, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: bw_tiles_any<4, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: bw_tiles_any<4, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: bw_tiles_any<4, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: bw_tiles_any<5, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: bw_tiles_any<5, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: bw_tiles_any<5, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: bw_tiles_any<5, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: bw_tiles_any<6, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: bw_tiles_any<6, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: bw_tiles_any<6, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: bw_tiles_any<6, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: bw_tiles_any<7, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: bw_tiles_any<7, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: bw_tiles_any<7, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: bw_tiles_any<7, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 0: bw_tiles_any<8, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: bw_tiles_any<8, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: bw_tiles_any<8, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: bw_tiles_any<8, false, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
-        }
+        case Isa::Vbmi: tiles_table<VbmiTiles>(mat, in, tout, m, tn0, tn1, ks); return;
+        case Isa::Vnni: tiles_table<VnniTiles>(mat, in, tout, m, tn0, tn1, ks); return;
+        case Isa::Bw: tiles_table<BwTiles>(mat, in, tout, m, tn0, tn1, ks); return;
         case Isa::Avx2:
         {
             // The shared selectors couple group-2 with planar packing. Fractional planes
