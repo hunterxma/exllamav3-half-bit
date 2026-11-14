@@ -636,6 +636,11 @@ class BCAttn:
             except BCKernelTooLarge:
                 return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
+            # The slot's graph is captured on its first run, from driver memory outside torch's pool. A new shape
+            # can first appear mid-generation (MTP verify after a prompt), when torch's cache holds most of the
+            # free device memory in idle blocks: a 24.5 GB model at split 104 left 79 MiB beside ~320 MiB cached-but-unused
+            # and the capture OOM'd. Returning the idle blocks first is cheap (once per slot)
+            torch.cuda.empty_cache()
         # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
         # loads); the block table is the only one bound per call rather than a whole static, and
         # the generator uploads it fresh each step. A caller passing a row slice of a device
