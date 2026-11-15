@@ -1,0 +1,11 @@
+CPU experts: E=104 H=2048 I=512 tokens=1 top_k=8 threads=6
+rate   us/call   GB/s (trellis bytes of the picked experts)
+   4      820.9     15.3
+ 4.5     1163.8     12.2
+   5      809.0     19.4
+ 5.5     1348.3     12.8
+   6      907.7     20.8
+ 6.5     1548.3     13.2
+   7     1050.0     21.0
+ 7.5     1882.2     12.5
+   8     1221.6     20.6

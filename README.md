@@ -9,33 +9,156 @@ tags:
 # exllamav3 with half-bit rates (4.5 to 7.5 bpw)
 
 A fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) v1.6.6, not affiliated with upstream.
-Upstream has half-bit EXL3 rates up to 3.5 bpw; this fork carries them on to 4.5, 5.5, 6.5 and 7.5, so a
-quantization can use a 4.5- or 5.5-bit tensor instead of jumping a whole bit. Models that use those rates won't load
-on stock exllamav3. Everything upstream loads still loads and runs the same.
 
-What's different:
+Whole-bit steps are a blunt tool when you're trying to fit a big MoE model into a fixed amount of VRAM and RAM.
+Upstream has half-bit EXL3 rates up to 3.5 bpw; this fork carries them on to 4.5, 5.5, 6.5 and 7.5, across the
+whole path: quantizer, GPU kernels and the CPU expert worker. It also speeds up the fused MoE decode kernel at
+5-6 bpw (integer rates included) and makes conversion roughly twice as fast.
 
-- **Kernels:** half-bit rates in packing, reconstruct, GEMM and the fused MoE kernels. The decode MoE kernel runs two
-  blocks per SM up to 6 bpw, which made end-to-end decode 11.6% faster on Qwen3.6-35B-A3B (RTX 5060 Ti).
-- **CPU experts:** half-bit rates on every ISA tier, with a packed layout and prefetching on AVX2, so models bigger
-  than your VRAM can keep some experts on the CPU at these rates. `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer,
-  and a layer stored at two rates puts the smaller group on the CPU.
-- **MTP drafting:** `-dpm` (only draft confident tokens), a sparse draft head (`-sdh`) and optional speculative
-  sampling (`-ssp`).
-- **Converter:** a much faster half-bit quantizer (bit-identical), routed-token sensitivity, and
-  `EXL3_CONVERT_REUSE` to copy unchanged tensors from an earlier build. A Qwen3.6-35B-A3B layer converts in about
-  200 s instead of 414 s.
+**Compatibility:** models that use 4.5-7.5 bpw need this fork; stock exllamav3 can't load them. Everything upstream
+loads still loads and runs the same here.
 
-Install (Linux, NVIDIA GPU with a driver for CUDA 12.6+, `git` and a C++ compiler; no CUDA toolkit needed):
+## Install
 
 ```bash
 git clone https://github.com/hunterxma/exllamav3-half-bit exllamav3 && bash exllamav3/install.sh
 ```
 
-The script picks the right PyTorch and CUDA compiler for your driver, builds for your GPU only and runs a self-test
-(15-40 minutes, mostly compiling). Then use `./venv/bin/python`. Tested on an RTX 5060 Ti (sm_120) with CUDA 13 and
-PyTorch 2.11 and 2.14. Benchmarks and details:
-[EXL3-Half-Bit-MoE-CUDA-Kernels](https://github.com/hunterxma/EXL3-Half-Bit-MoE-CUDA-Kernels).
+You need Linux with an NVIDIA GPU (compute 7.5+) and a driver for CUDA 12.6 or newer (12.8+ for RTX 50-series),
+`git` and a C++ compiler (`sudo apt install git build-essential`), and about 12 GB of disk. For models bigger than
+your VRAM you also want an AVX2 CPU and enough free RAM for the experts that run on it.
+
+No CUDA toolkit needed. The script picks the right PyTorch and CUDA compiler for your driver, builds for your GPU
+only and runs a self-test over every bitrate. Expect 15-40 minutes, almost all of it compiling. Then use
+`./venv/bin/python` (or `source venv/bin/activate`).
+
+<details>
+<summary>Installer options and tested systems</summary>
+
+| Variable | Effect |
+|---|---|
+| `CUDA_HOME` | use this CUDA toolkit |
+| `EXL3_CUDA=12.8` | force a PyTorch CUDA family (12.6 / 12.8 / 12.9 / 13.0) |
+| `EXL3_PIP_CUDA=1` | use the pip CUDA compiler even if a toolkit exists |
+| `EXL3_ARCH="8.6;12.0"` | build for these architectures |
+| `MAX_JOBS` | parallel compile jobs (default: by RAM) |
+| `TORCH_SPEC`, `EXL3_VENV` | PyTorch version, venv location |
+| `EXL3_NO_SELFTEST=1` | build only |
+
+Clean-environment installs (empty home directory, no CUDA toolkit), RTX 5060 Ti (sm_120), driver 595:
+
+| System | Installer picked | Build |
+|---|---|---|
+| Ubuntu, glibc 2.43, g++ 15, apt `nvcc` 12.4 only | PyTorch cu130 + pip CUDA 13.2 | 14 min (idle CPU, 6 jobs) |
+| Ubuntu 24.04 container, g++ 13, no toolkit (earlier version) | PyTorch cu128 + CUDA 12.9.2 redist | 22 min |
+
+CUDA 12.x headers don't compile against glibc 2.41+; the installer tells you, and the fix is a driver for CUDA 13
+(R580+). Every architecture from sm_75 to sm_121 has compiled; only sm_120 has been run.
+
+</details>
+
+## Use it
+
+Convert at a half-bit rate (same converter; `-b` now also takes 4.5, 5.5, 6.5 and 7.5):
+
+```bash
+python convert.py -i /path/to/hf-model -o /path/to/out -w /path/to/work -b 4.5
+```
+
+Or give each tensor its own rate with a recipe (later lines override earlier ones, wildcards allowed):
+
+```yaml
+# recipe.yaml  ->  python convert.py -i ... -o ... -w ... --recipe recipe.yaml
+tensors:
+  "*.mlp.experts.*.down_proj": 5
+  "*.mlp.experts.*.gate_proj": 4.5
+  "*.mlp.experts.*.up_proj": 4.5
+  "*.self_attn.*": 8
+```
+
+Run it like any EXL3 model, e.g. `python examples/chat.py -m /path/to/out -mode qwen35`. If the model is larger
+than your VRAM, `EXL3_MOE_CPU_SPLIT=N` runs N experts of every MoE layer on the CPU.
+
+## Does half a bit help?
+
+Qwen3.6-35B-A3B, KLD against BF16 on the same 30,149-token held-out set:
+
+| Build | Rates | Size | KLD mean | Same top-1 |
+|---|---|---|---|---|
+| integer rates only | 4-8 | 24.61 GB | 0.0166 | 97.4% |
+| half-bit rates, 4.5 in the middle layers | 4.5-8 | 23.87 GB | 0.0157 | 97.2% |
+| half-bit rates + rate tiers (our released model) | 4.5-8 | 24.51 GB | 0.0156 | 97.4% |
+
+The half-bit builds come out smaller and closer to BF16. The allocations differ in more than just the half steps,
+so treat this as "half bits make better allocations reachable", not a pure A/B of the rate itself.
+
+## What's changed
+
+| Area | Change | Checked against |
+|---|---|---|
+| Format, GEMM | 4.5-7.5 bpw in packing, reconstruct, GEMM and MoE kernels | 601 kernel tests |
+| Decode MoE kernel | 2 blocks per SM up to 6 bpw | identical output to the previous kernel |
+| Quantizer | register-resident half-rate trellis search | bit-identical to the reference kernel |
+| Converter | routed-token sensitivity, no host syncs, faster g-scale search; `EXL3_CONVERT_REUSE=<build>` copies unchanged tensors from an earlier build | fp32-identical statistics |
+| CPU experts | half rates on AVX2, AVX-512 and the scalar path; packed planar layout + prefetch on AVX2 | within 1.3% of the GPU result; bit-exact A/B |
+| CPU placement | `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer; a layer stored at two rates puts the smaller group on the CPU | identical output |
+| MTP drafting | `-dpm` confidence threshold, sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`) | same tokens / same output distribution |
+| Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
+
+Run the tests with `pytest tests/kernels/quant tests/kernels/moe tests/moe_cpu`.
+
+## Benchmarks
+
+RTX 5060 Ti 16 GB, Ryzen 5 3600 (6 cores, AVX2), batch size 1. Raw output in
+[`doc/half-bit-bench/`](doc/half-bit-bench).
+
+**GPU decode MoE kernel**, µs per layer call (Qwen3.6-35B-A3B expert shape, one token, CUDA graphs,
+`science/moe_coop_bench.py --graph`):
+
+| bpw | 4.0 | 4.5 | 5.0 | 5.5 | 6.0 | 6.5 | 7.0 | 7.5 | 8.0 |
+|---|---|---|---|---|---|---|---|---|---|
+| before | 60.1 | 66.5 | 81.2 | 101.3 | 84.5 | 106.2 | 107.8 | 110.8 | 107.3 |
+| after | 60.1 | 67.4 | **70.2** | **75.3** | **74.0** | 103.1 | 105.7 | 108.4 | 106.1 |
+
+For integer rates, "before" is upstream's kernel; for half rates it's this fork before the kernel change. 4.5 is
+within noise; the gains are at 5-6 bpw.
+
+**CPU expert worker**, µs per call (104 experts in RAM, one token routed to 8 of them, 6 threads, AVX2,
+`science/moe_cpu_bench.py --swizzle`):
+
+| bpw | 4 | 4.5 | 5 | 5.5 | 6 | 6.5 | 7 | 7.5 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| packed | 516 | 642 | 553 | 610 | 616 | 660 | 736 | 742 | 717 |
+| unpacked | | 1191 | | 1376 | | 1572 | | 1910 | |
+
+5.5 and 6.5 cost about the same as their integer neighbours. 4.5 is the exception: on the CPU it's slower than 5,
+so if experts end up on the CPU anyway, store them at 5.
+
+**Conversion:** the half-rate trellis search runs 1.35-2.1x faster than the reference kernel, and a full
+Qwen3.6-35B-A3B layer converts in about 200 s instead of 414 s.
+
+**End to end**, same model and settings, only the kernels changed (24.6 GB integer-rate Qwen3.6-35B-A3B, 104 of
+256 experts per layer on the CPU, MTP with 4 drafts, 32k context, 8-bit cache):
+
+| | Decode | Prompt | Peak VRAM |
+|---|---|---|---|
+| upstream kernels | 75.7 tok/s | 368 tok/s | 15.25 GB |
+| this fork | **84.5 tok/s** (+11.6%) | 374 tok/s | 15.31 GB |
+
+Our released half-bit model reaches 109.8 tok/s on the same card, but most of that gain comes from tuned MTP
+settings.
+
+## Limitations
+
+- Half rates need the mul1 codebook.
+- Based on exllamav3 v1.6.6; newer upstream versions need the changes rebased.
+- Only one GPU (RTX 5060 Ti) and one CPU (Ryzen 5 3600, AVX2) have actually been run. Everything else compiles but
+  is untested.
+- Linux only, no ROCm build of the half-rate kernels.
+
+Found a problem? Open an issue here with your GPU, driver version and the installer output.
+
+---
 
 Everything below this section is upstream's README.
 
