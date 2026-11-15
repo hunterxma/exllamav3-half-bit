@@ -8,31 +8,42 @@ tags:
 
 # exllamav3 with half-step rates (4.5 to 7.5 bpw)
 
-A fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) v1.6.6, not affiliated with upstream.
-It adds EXL3 trellis rates at half-bit steps (4.5, 5.5, 6.5 and 7.5 bpw) for dense and MoE layers, so a quant
-can mix in a 4.5- or 5.5-bit tensor instead of jumping a whole bit. Models built with these rates, such as
-[Qwen3.8-27B-EXL3-H500](https://huggingface.co/HydraAiM/Qwen3.8-27B-EXL3-H500), won't load on stock exllamav3.
-Integer-rate models load and run the same as upstream.
+This is a fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) v1.6.6. It is not affiliated
+with upstream. It adds EXL3 trellis rates at half-bit steps (4.5, 5.5, 6.5 and 7.5 bpw) for dense and MoE layers.
+Thus, a quantization can use a 4.5-bit or 5.5-bit tensor and does not have to go up one full bit. Models that use these
+rates do not load on stock exllamav3, for example
+[Qwen3.6-35B-A3B-EXL3](https://huggingface.co/HydraAiM/Qwen3.6-35B-A3B-EXL3). Integer-rate models load and run the
+same as upstream.
 
-What the fork changes:
+Changes in this fork:
 
-- **Format and GPU kernels:** half rates in packing, reconstruct, GEMM and the fused MoE kernels; the fused decode MoE
-  kernel runs 2 blocks per SM up to 6 bpw (end to end +11.6% decode on Qwen3.6-35B-A3B, RTX 5060 Ti).
-- **CPU expert worker:** half rates on every ISA tier, with a packed planar layout on AVX2 (on by default,
-  `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=0` turns it off), so models larger than VRAM can offload experts at these rates.
+- **Format and GPU kernels:** half rates in packing, reconstruct, GEMM and the fused MoE kernels. The fused decode
+  MoE kernel runs 2 blocks per SM up to 6 bpw (+11.6% end-to-end decode on Qwen3.6-35B-A3B, RTX 5060 Ti).
+- **CPU expert worker:** half rates on all ISA tiers (AVX2, AVX-512 BW / VNNI / VBMI, scalar). AVX2 uses a packed
+  planar layout (on by default; `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=0` turns it off) and software prefetch. Thus, models
+  that are larger than VRAM can run some experts on the CPU at these rates.
+- **CPU expert placement:** `EXL3_MOE_CPU_SPLIT_MAP` sets the number of CPU experts for each layer. When the experts
+  of a layer have two rates, the smaller group runs on the CPU. `EXL3_MOE_CPU_SPLIT_DRAFT` sets the split of the MTP
+  layer (0 = all its experts on the GPU).
+- **MTP drafting:** `draft_p_min` / `-dpm` drafts a token only when the drafter gives it a minimum probability.
+  `sparse_draft_head` / `-sdh` drafts through a smaller LM head. Opt-in speculative sampling (`-ssp`) keeps the output
+  distribution identical.
 - **Quantizer:** register-resident half-rate trellis search (bit-identical, 1.35-2.1x faster), output-sensitivity
-  statistics on routed tokens only, sync-free capture; whole-convert time per Qwen3.6-35B-A3B layer 414 -> ~200 s.
-- **Loader:** honours `model.safetensors.index.json` when several shards hold the same tensor.
+  statistics on routed tokens only, sync-free capture. `EXL3_CONVERT_REUSE=<build>` copies the tensors that keep
+  their rate from an existing build. Whole-convert time per Qwen3.6-35B-A3B layer: 414 s to approximately 200 s.
+- **Loader:** obeys `model.safetensors.index.json` when two or more shards hold the same tensor.
 
-Install on Linux with an NVIDIA GPU (compute 7.5 or newer), a driver and a CUDA toolkit:
+Install on Linux with an NVIDIA GPU (compute 7.5 or newer) and its driver. You also need `git` and a C++ compiler. You
+do not need a CUDA toolkit or root access:
 
 ```bash
 git clone https://github.com/hunterxma/exllamav3-half-bit exllamav3 && bash exllamav3/install.sh
 ```
 
-`install.sh` finds the GPU and a CUDA toolkit the driver supports, makes a venv in `./venv` with the matching
-PyTorch, builds the extension for your GPU only and runs a self-test of every bitrate (10 to 30 minutes, mostly the
-build). Run scripts with `./venv/bin/python`. Tested on an RTX 5060 Ti (sm_120), CUDA 13.1, PyTorch 2.11 and 2.14.
+`install.sh` finds the GPU and the CUDA version of the driver. It makes a venv in `./venv` with the correct PyTorch.
+If there is no local CUDA toolkit that the driver can use, it installs the NVIDIA pip CUDA compiler into the venv.
+It builds the extension for your GPU only and does a self-test of all bitrates (15 to 40 minutes, mostly the build).
+Run scripts with `./venv/bin/python`. Tested on an RTX 5060 Ti (sm_120), CUDA 13, PyTorch 2.11 and 2.14.
 
 Everything below this section is upstream's README.
 
