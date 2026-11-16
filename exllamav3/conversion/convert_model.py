@@ -880,6 +880,9 @@ def reuse_linears(linears, strategy):
     (e.g. a bitrate tier of the cold experts), only the changed tensors are quantized. The reused tensors were quantized
     against the old build's calibration stream; they are the same tensors a hybrid of the two builds would take.
     Returns the linears left to quantize.
+
+    EXL3_CONVERT_REQUANT=<dir>: a linear with a <key>.safetensors file there is quantized again at its stored rate
+    (e.g. the --hessians directory, to redo only the tensors that get an output-side Hessian).
     """
     global _reuse
     root = os.environ.get("EXL3_CONVERT_REUSE")
@@ -899,7 +902,7 @@ def reuse_linears(linears, strategy):
     keep, n = [], 0
     for l in linears:
         k = l.key
-        if k + ".trellis" not in wm or k + ".mul1" not in wm:
+        if k + ".trellis" not in wm or k + ".mul1" not in wm or _reuse_requant(k):
             keep.append(l)
             continue
         trellis = get(k + ".trellis", l.device)
@@ -918,10 +921,18 @@ def reuse_linears(linears, strategy):
     return keep
 
 
+def _reuse_requant(k) -> bool:
+    """EXL3_CONVERT_REQUANT=<dir>: linear k has a file there, so it is quantized again instead of reused"""
+    d = os.environ.get("EXL3_CONVERT_REQUANT")
+    return bool(d) and os.path.exists(os.path.join(d, k + ".safetensors"))
+
+
 def _reuse_rate(k):
-    """Stored rate of linear k in the EXL3_CONVERT_REUSE build (None: not there / no codebook marker)"""
+    """Stored rate of linear k in the EXL3_CONVERT_REUSE build (None: not there / no codebook marker / requantized)"""
     global _reuse
     root = os.environ["EXL3_CONVERT_REUSE"]
+    if _reuse_requant(k):
+        return None
     if _reuse is None:
         _reuse = {"wm": json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"], "h": {}}
     wm, handles = _reuse["wm"], _reuse["h"]
