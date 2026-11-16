@@ -25,6 +25,15 @@ _spec = importlib.util.spec_from_file_location(
 cuda_flags = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cuda_flags)
 
+# Build for every GPU in the system unless TORCH_CUDA_ARCH_LIST names the targets: torch's own default
+# covers the current device only, so on a mixed system the other cards would have no kernel image
+if precompile and torch:
+    _spec = importlib.util.spec_from_file_location(
+        "arch_list", os.path.join(os.path.dirname(os.path.abspath(__file__)), "exllamav3", "util", "arch_list.py")
+    )
+    _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
+    print(f"Building for TORCH_CUDA_ARCH_LIST={os.environ.get('TORCH_CUDA_ARCH_LIST', '(torch default)')}")
+
 extra_cflags = []
 extra_cuda_cflags = cuda_flags.cuda_cflags(
     cuda_home = cpp_extension.CUDA_HOME,
