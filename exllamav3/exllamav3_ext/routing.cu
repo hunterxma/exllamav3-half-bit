@@ -243,6 +243,85 @@ void routing_gemv_kernel
         scores[row] = __float2half_rn(sum);
 }
 
+// The same GEMV for 2..RGEMV_MAX_ROWS rows (decode-shaped: MTP verify rounds), each gate row read once for all of
+// them. Every row's sum takes exactly the single-row kernel's FMA order and reduction, so a token routes
+// bit-identically whichever row count it is part of
+#define RGEMV_MAX_ROWS 8
+
+template <int R>
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_rows_kernel
+(
+    const half* __restrict__ x,         // (R, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (R, E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+
+    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+    const int k2 = k / 2;
+
+    float sum[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+    for (int j = lane; j < k2; j += 32)
+    {
+        float2 wf = __half22float2(w2[j]);
+        #pragma unroll
+        for (int r = 0; r < R; ++r)
+        {
+            float2 xf = __half22float2(((const half2*) x)[(size_t) r * k2 + j]);
+            sum[r] = fmaf(xf.x, wf.x, sum[r]);
+            sum[r] = fmaf(xf.y, wf.y, sum[r]);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        float s = sum[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_down_sync(0xffffffffu, s, offset);
+        if (lane == 0)
+            scores[(size_t) r * E + row] = __float2half_rn(s);
+    }
+}
+
+static bool routing_gemv_rows_try(const at::Tensor& hidden, const at::Tensor& gate_t, at::Tensor& scores, cudaStream_t stream)
+{
+    // EXL3_ROUTING_GEMV_ROWS=0 keeps the int8 projection for every multi-row call
+    static int env = -2;
+    if (env == -2) { const char* e = std::getenv("EXL3_ROUTING_GEMV_ROWS"); env = e ? atoi(e) : 1; }
+    if (!env) return false;
+    const int k = hidden.size(-1);
+    const int E = scores.size(-1);
+    const int rows = hidden.numel() / k;
+    if (rows < 2 || rows > RGEMV_MAX_ROWS || (k & 1) || !hidden.is_contiguous() || !scores.is_contiguous() ||
+        scores.numel() != (int64_t) rows * E ||
+        (((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.data_ptr()) & 3)) return false;
+    const half* x = (const half*) hidden.data_ptr();
+    const half* w = (const half*) gate_t.data_ptr();
+    half* s = (half*) scores.data_ptr();
+    dim3 grid(CEIL_DIVIDE(E, RGEMV_WARPS)), block(RGEMV_WARPS * 32);
+    switch (rows)
+    {
+        case 2: routing_gemv_rows_kernel<2><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        case 3: routing_gemv_rows_kernel<3><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        case 4: routing_gemv_rows_kernel<4><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        case 5: routing_gemv_rows_kernel<5><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        case 6: routing_gemv_rows_kernel<6><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        case 7: routing_gemv_rows_kernel<7><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+        default: routing_gemv_rows_kernel<8><<<grid, block, 0, stream>>>(x, w, s, k, E); break;
+    }
+    return true;
+}
+
 void routing_gemv
 (
     const at::Tensor& hidden,
@@ -274,6 +353,13 @@ void routing_gemv
     // both are fixed-order and agree across devices
     if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= 3) &&
         routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
+#endif
+
+#if !defined(USE_ROCM)
+    // Decode-shaped row counts (2..8): the single-row FMA GEMV per row, gate read once. Same scores per token as a
+    // single-row call (the int8 projection rounded the gate, so a token's experts could differ between a one-token
+    // pass and an MTP verify round), and on the RTX 3060 4x faster than the int8 kernel at these sizes
+    if (!bsz1 && gate_t.has_value() && routing_gemv_rows_try(hidden, gate_t.value(), scores, stream)) return;
 #endif
 
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
