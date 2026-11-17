@@ -73,6 +73,10 @@ _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
 # Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
 # three-launch BC_GatedMLP graph
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
+# GPU rate tier at decode sizes: the second-rate module's experts join this module's fused decode launches
+# (BC_BlockSparseMLP.attach_tier: one run table, rotation and per-token reduction, a gate/up launch per rate) instead
+# of running as a second module; 0 keeps two modules (prefill always runs two)
+_tier_merged = os.environ.get("EXL3_MOE_TIER_MERGED", "1") != "0"
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -773,6 +777,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 act_relu2 = self.activation_fn == "relu2",
                 sh_coop = self.shared_coop_ok(),
             )
+            self._tier_merged = bool(
+                _tier_merged and self._tier is not None and self._tier.bc is not None and
+                self.bc.attach_tier(self._tier.bc, self.routing_last)
+            )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
             # N = 128 kernel instances) exist for the mul1 codebook; with them the fused tier's
@@ -1071,6 +1079,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def unload(self):
         self.cpu_unload()
         self.bc = None
+        self._tier_merged = False
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1107,6 +1116,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
         bc_sh_exp = False
+        tier_done = False
         if params.get("autosplit_measure"):
             self._measure_rows = bsz
         # Shape of the routed sum: the experts' width is the latent width in a latent MoE
@@ -1672,10 +1682,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
+            tier_done = self._tier_merged   # the tier's experts ran in the same launches
 
         # GPU rate tier (block_sparse_mlp_cpu.load_gpu_tier): the second-rate experts' partial sum, from the
         # same fused kernels in their own module
-        if self._tier is not None:
+        if self._tier is not None and not tier_done:
             final_hidden_states = final_hidden_states.view(eshape)
             final_hidden_states += self._tier.forward(
                 y, dict(params, moe_tier_routing = (selected_experts, routing_weights))).view(eshape)

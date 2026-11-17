@@ -744,6 +744,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         return;
     }
     const int local = slot_info(p, sh_rows[0]).local;
+    if (p.tier_only && ((local >= p.tier_first) != (p.tier_only == 2))) return;   // the other rate's launch
     const int kslices_all = p.Hi / 16;
     const int k_begin = kslices_all * ks / p.ksplit_a;
     const int k_end = kslices_all * (ks + 1) / p.ksplit_a;
@@ -869,6 +870,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
     const int local = slot_info(p, sh_rows[0]).local;
+    if (p.tier_only && ((local >= p.tier_first) != (p.tier_only == 2))) return;   // the other rate's launch
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
     const int k_end = kslices_all * (ks + 1) / p.ksplit_b;

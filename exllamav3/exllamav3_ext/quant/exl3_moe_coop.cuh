@@ -34,6 +34,11 @@ struct MoeCoopParams
     int H_out;                  // output width (<= Ho)
     int min_expert;             // -1: no expert-range filtering; else sel in [min, max) is local
     int max_expert;
+    // GPU rate tier (BC_BlockSparseMLP::attach_tier): local experts >= tier_first are stored at a second bit rate.
+    // One run table and rotation cover both; a gate/up (or down) launch per rate serves its own experts' runs
+    // (tier_only 1: local < tier_first, 2: local >= tier_first, 0: every run)
+    int tier_first;             // 0: no second rate
+    int tier_only;
 
     // Per-expert pointer tables (int64 device arrays indexed by local expert)
     const int64_t* g_trellis;   const int64_t* g_suh;   const int64_t* g_svh;
@@ -80,7 +85,8 @@ struct MoeCoopParams
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
 // 1 mcg, 2 mul1 codebook, uniform across the three projections
-void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream);
+void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
+                          float K_gu2 = 0.0f, float K_d2 = 0.0f);
 
 // Static part of the parameter block, validated once from the module's tensors (BC construction);
 // K_gu / K_d / cb come back through the out-params. Gate tables/scratch are ignored when
@@ -116,7 +122,8 @@ void exl3_moe_coop_run
 (
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
-    const c10::optional<at::Tensor>& sh_out
+    const c10::optional<at::Tensor>& sh_out,
+    float K_gu2 = 0.0f, float K_d2 = 0.0f     // second rate of experts >= p.tier_first (p.tier_first > 0)
 );
 
 // Tensor front end (prepare + run; the test entry point)

@@ -85,6 +85,15 @@ struct BC_BlockSparseMLP
     MoeCoopParams coop_p;
     float coop_K_gu, coop_K_d; int coop_cb;
 
+    // GPU rate tier: a second module holding this layer's experts [first, E) at another bit rate (attach_tier). Its
+    // pointer tables are appended to this module's [0, first) ones, so one decode launch sequence (one run table and
+    // rotation, a gate/up launch per rate, one down launch per distinct down rate, one per-token reduction) covers both
+    std::shared_ptr<BC_BlockSparseMLP> tier;
+    MoeCoopParams tier_p;
+    float tier_K_gu = 0, tier_K_d = 0;
+    std::vector<at::Tensor> tier_tables;    // concatenated int64 pointer tables, kept alive
+    bool attach_tier(std::shared_ptr<BC_BlockSparseMLP> _tier, int first);
+
     // Shared expert as its own one-expert fused launch (at its own bit width) instead of the
     // three latency-bound GEMV launches of the BC_GatedMLP graph; the routed launch merges its
     // output (through the sigmoid gate when there is one) exactly as before. Built when enabled

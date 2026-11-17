@@ -140,7 +140,8 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     done[kernel] = smem;
 }
 
-void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
+void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
+                          float K_gu2, float K_d2)
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
@@ -163,6 +164,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
+    // Second bit rate (GPU rate tier): its own gate/up kernel, and its own down kernel when that rate differs too
+    const bool tier = p.tier_first > 0;
+    const bool tier_b = tier && K_d2 != K_d;
+    MoeCoopKernel ka2 = tier ? moe_coop_kernel_a(K_gu2, cb, p.Hi, wide_a) : ka;
+    MoeCoopKernel kb2 = tier_b ? moe_coop_kernel_b(K_d2, cb, wide_b) : kb;
+    if (tier) { moe_coop_smem_optin(ka2.kernel, ka2.smem); moe_coop_smem_optin(kb2.kernel, kb2.smem); }
 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
@@ -179,8 +186,32 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         const int rot_grid = CEIL_DIVIDE(rot_items, MOE_COOP_THREADS / 32);
         exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
     }
-    cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
-    cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+    if (!tier)
+    {
+        cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
+        cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+    }
+    else
+    {
+        // Each launch serves its own rate's runs (the rest exit at once); the per-slot gate/up counters belong to one
+        // rate, and the down stage's per-token counters count every active slot, so the token's last arrival (in
+        // either down launch) sums both rates' slots
+        MoeCoopParams p1 = p, p2 = p;
+        p1.tier_only = 1; p2.tier_only = 2; p.tier_only = 0;
+        void* args1[] = { (void*) &p1 };
+        void* args2[] = { (void*) &p2 };
+        cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args1, ka.smem, stream));
+        cuda_check(cudaLaunchKernel(ka2.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args2, ka2.smem, stream));
+        if (!tier_b)
+        {
+            cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+        }
+        else
+        {
+            cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args1, kb.smem, stream));
+            cuda_check(cudaLaunchKernel(kb2.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args2, kb2.smem, stream));
+        }
+    }
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -307,7 +338,8 @@ void exl3_moe_coop_run
 (
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
-    const c10::optional<at::Tensor>& sh_out
+    const c10::optional<at::Tensor>& sh_out,
+    float K_gu2, float K_d2
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -335,7 +367,7 @@ void exl3_moe_coop_run
     }
     else
         p.sh_gate_w = nullptr;
-    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream);
+    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, K_gu2, K_d2);
 }
 
 void exl3_moe_coop

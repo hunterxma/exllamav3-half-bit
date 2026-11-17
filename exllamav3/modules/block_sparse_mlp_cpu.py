@@ -455,6 +455,7 @@ class BlockSparseMLP_CPU:
         self._tier_saved = None
         self._is_tier = False         # this module IS such a tier (routed by its parent)
         self._buf_suffix = ""
+        self._tier_merged = False     # the tier's experts run inside this module's fused decode launches
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,

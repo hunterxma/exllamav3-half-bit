@@ -107,7 +107,46 @@ void BC_BlockSparseMLP::run_bszN
         shared_experts->run_bszN(x_dense, out_d_sh_n);
         sh_o = out_d_sh_n;
     }
-    exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+    if (tier)
+        exl3_moe_coop_run(tier_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, tier_K_gu, tier_K_d);
+    else
+        exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+}
+
+bool BC_BlockSparseMLP::attach_tier(std::shared_ptr<BC_BlockSparseMLP> _tier, int first)
+{
+    // Same codebook, both modules covering complementary ranges [0, first) and [first, E), no biases (the
+    // concatenated tables carry trellis / suh / svh only)
+    const BC_BlockSparseMLP& t = *_tier;
+    if (coop_cb != t.coop_cb || gated != t.gated || coop_p.min_expert != 0 || coop_p.max_expert != first ||
+        t.coop_p.min_expert != first || coop_p.g_bias || coop_p.u_bias || coop_p.d_bias ||
+        coop_p.Hi != t.coop_p.Hi || coop_p.I != t.coop_p.I || coop_p.Ho != t.coop_p.Ho)
+        return false;
+    auto cat = [&] (const at::Tensor& a, const at::Tensor& b)
+    {
+        at::Tensor c = at::cat({a, b}, 0).contiguous();
+        tier_tables.push_back(c);
+        return (const int64_t*) c.data_ptr();
+    };
+    tier_p = coop_p;
+    tier_p.g_trellis = cat(gate_ptrs_trellis, t.gate_ptrs_trellis);
+    tier_p.g_suh     = cat(gate_ptrs_suh,     t.gate_ptrs_suh);
+    tier_p.g_svh     = cat(gate_ptrs_svh,     t.gate_ptrs_svh);
+    tier_p.u_trellis = cat(up_ptrs_trellis,   t.up_ptrs_trellis);
+    tier_p.u_suh     = cat(up_ptrs_suh,       t.up_ptrs_suh);
+    tier_p.u_svh     = cat(up_ptrs_svh,       t.up_ptrs_svh);
+    tier_p.d_trellis = cat(down_ptrs_trellis, t.down_ptrs_trellis);
+    tier_p.d_suh     = cat(down_ptrs_suh,     t.down_ptrs_suh);
+    tier_p.d_svh     = cat(down_ptrs_svh,     t.down_ptrs_svh);
+    tier_p.n_local = coop_p.n_local + t.coop_p.n_local;
+    tier_p.min_expert = -1;
+    tier_p.max_expert = -1;
+    tier_p.tier_first = first;
+    tier_p.tier_only = 0;
+    tier_K_gu = t.coop_K_gu;
+    tier_K_d = t.coop_K_d;
+    tier = _tier;
+    return true;
 }
 
 #if defined(USE_ROCM)

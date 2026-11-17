@@ -109,5 +109,6 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
 )
 .def_readonly("sh_coop", &BC_BlockSparseMLP::sh_coop)
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
+.def("attach_tier", &BC_BlockSparseMLP::attach_tier)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)
 .def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq);
