@@ -110,6 +110,7 @@ so treat this as "half bits make better allocations reachable", not a pure A/B o
 | GPU rate tier | a layer stored at two rates runs on the GPU in one fused decode launch sequence: one run table and rotation, a gate/up launch per rate, one per-token reduction (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it) | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
 | Decode MoE kernel | one completion arrival per block for all its rows (was one fence and up to three barriers per row); the down stage always on the wide tile | identical output, 267 MoE kernel tests on sm_86 and sm_120 |
 | Decode MoE path | a two-rate layer's gate/up in one launch; the shared expert on a side stream joined before the down stage; router for 2-8 rows uses the single-row FMA GEMV per row (a token routes the same in an MTP verify round as alone) | bit-identical output (router: identical to single-row routing); same kernel test counts on sm_86 and sm_120 |
+| Decode attention | split kernel at one pipeline stage for head_dim 256 on CUDA (`EXL3_ATTN_HD256_1STAGE=0` restores two): 1.5-1.8x faster kernel at 32k-96k context | same math; outputs differ only at fp16 rounding (~1e-4), as with any split-count change |
 | Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
 | Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
 
@@ -170,6 +171,7 @@ Qwen3.6-35B-A3B) fits whole in the two cards. Decode at 32k context, 8-bit cache
 | both rates in one launch sequence | +1.5% |
 | wide tile for the MoE down stage | 190 tok/s |
 | both gate/up rates in one launch, exact multi-row router, shared expert on a side stream | 188-194 tok/s (+3-4% at the same draft acceptance) |
+| split-decode attention at one pipeline stage (head_dim 256) | same at short context; 138 -> 150 tok/s at 64k context (+9%) |
 
 Clocks: 5060 Ti +350 MHz core / +5200 MHz memory, 3060 +150 / +2000, power capped at 170 W and 140 W. At stock
 clocks the same setting decodes 173 tok/s.
