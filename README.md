@@ -103,7 +103,8 @@ so treat this as "half bits make better allocations reachable", not a pure A/B o
 | CPU experts | half rates on AVX2, AVX-512 and the scalar path; packed planar layout + prefetch on AVX2 | within 1.3% of the GPU result; bit-exact A/B |
 | CPU placement | `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer; a layer stored at two rates puts the smaller group on the CPU | identical output |
 | MTP drafting | `-dpm` confidence threshold, sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`) | same tokens / same output distribution |
-| GPU rate tier | a layer stored at two rates runs as two uniform-rate fused modules on the GPU (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it). T5 on two GPUs: 126 -> 151-160 tok/s at 32k | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
+| GPU rate tier | a layer stored at two rates runs on the GPU in one fused decode launch sequence: one run table and rotation, a gate/up launch per rate, one per-token reduction (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it) | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
+| Decode MoE kernel | one completion arrival per block for all its rows (was one fence and up to three barriers per row) | identical output, 267 MoE kernel tests on sm_86 and sm_120 |
 | Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
 | Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
 
@@ -111,7 +112,7 @@ Run the tests with `pytest tests/kernels/quant tests/kernels/moe tests/moe_cpu`.
 
 ## Benchmarks
 
-RTX 5060 Ti 16 GB, Ryzen 5 3600 (6 cores, AVX2), batch size 1. Raw output in
+RTX 5060 Ti 16 GB, Ryzen 5 3600 (6 cores, AVX2), batch size 1, unless the section says two GPUs. Raw output in
 [`doc/half-bit-bench/`](doc/half-bit-bench).
 
 **GPU decode MoE kernel**, µs per layer call (Qwen3.6-35B-A3B expert shape, one token, CUDA graphs,
@@ -150,12 +151,36 @@ Qwen3.6-35B-A3B layer converts in about 200 s instead of 414 s.
 Our released half-bit model reaches 109.8 tok/s on the same card, but most of that gain comes from tuned MTP
 settings.
 
+**Two GPUs** (RTX 3060 12 GB + RTX 5060 Ti 16 GB, Ryzen 5 3600, batch size 1). Our released half-bit model (24.51 GB,
+Qwen3.6-35B-A3B) fits whole in the two cards. The 3060 sits in a chipset slot (PCIe 2.0 x4); that costs nothing
+measurable at decode. Each step adds to the one above it; decode at 32k context, 8-bit cache:
+
+| Setting | Decode |
+|---|---|
+| one RTX 5060 Ti, 104 experts per layer on the CPU, MTP 4 drafts | 114.7 tok/s |
+| both GPUs, 4 experts per layer on the CPU (the 112 second-rate experts of layers 8-29 still on the CPU) | 126 tok/s |
+| every expert on the GPUs: GPU rate tier | 151-160 tok/s |
+| MTP 6 drafts instead of 4 | 170 tok/s |
+| more layers on the faster card (`-gs 8.8,15.0`) and a +150 MHz core offset on the 3060 | 180 tok/s |
+| one completion arrival per block in the decode MoE kernel | 186 tok/s |
+| both rates in one launch sequence | +1.5% (183 vs 180 tok/s in the same session) |
+
+At 96k context the same setting decodes 150-180 tok/s and reads a 92k-token prompt at 1,514 tok/s (the CPU-split
+setting: 117-131 and 1,035). Peak VRAM at 96k: 10.2 of 12 GiB on the 3060, 15.0 of 15.9 GiB on the 5060 Ti.
+
+Decode on these cards is limited by the arithmetic of the trellis decode, not memory bandwidth: lowering the core
+clock 31% made the MoE kernels 40-51% slower. The MoE and dense kernels both decode roughly 280-400 billion weights
+a second; the remaining kernel work is in fixed per-block costs, not the decode itself.
+
+`install.sh` in the model repository finds this setting on its own: it splits the model across every GPU, gives
+each card a VRAM budget and drafts 6 tokens when every expert fits on the GPUs.
+
 ## Limitations
 
 - Half rates need the mul1 codebook.
 - Based on exllamav3 v1.6.6; newer upstream versions need the changes rebased.
-- Only one GPU (RTX 5060 Ti) and one CPU (Ryzen 5 3600, AVX2) have actually been run. Everything else compiles but
-  is untested.
+- Only two GPUs (RTX 5060 Ti, sm_120, and RTX 3060, sm_86, alone and together) and one CPU (Ryzen 5 3600, AVX2)
+  have actually been run. Everything else compiles but is untested.
 - Linux only, no ROCm build of the half-rate kernels.
 
 Found a problem? Open an issue here with your GPU, driver version and the installer output.
