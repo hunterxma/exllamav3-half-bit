@@ -558,6 +558,23 @@ __device__ __forceinline__ bool arrive_last(int* counter, int expected, int* sh_
     return last;
 }
 
+// Completion arrivals for every row of a run at once: one fence and one barrier for the block instead of one per
+// row (a run's rows are distinct tokens, so no two share a counter). Thread r < nrows arrives on counters[r] with
+// expected[r]; sh_last[r] says whether it was the last arrival. The caller fences again before reading other blocks'
+// results when any row was last (returned)
+__device__ __forceinline__ bool arrive_rows(int nrows, int* sh_last, int* counter_r, int expected_r)
+{
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x < nrows)
+        sh_last[threadIdx.x] = (atomicAdd(counter_r, 1) == expected_r - 1) ? 1 : 0;
+    __syncthreads();
+    bool any = false;
+    for (int r = 0; r < nrows; ++r) any |= sh_last[r] != 0;
+    if (any) __threadfence();
+    return any;
+}
+
 // Number of active slots of a token
 __device__ __forceinline__ int token_active_slots(const MoeCoopParams& p, int row)
 {
@@ -693,7 +710,6 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
     half* sh_A = (half*) smem_dyn;
     float* sh_red = (float*) (smem_dyn + p.Hi / 2);
     uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
-    __shared__ int sh_flag;
     __shared__ int sh_res[4];
     __shared__ int sh_rows[ROWS];
 
@@ -760,12 +776,17 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
     }
 
+    static_assert(CPB == 1, "batched arrivals assume one 128-column chunk per block");
+    __shared__ int sh_last[ROWS];
+    const int chunk = (group * CPB) / GPC;
+    {
+        int* ctr = threadIdx.x < nrows ? p.ctr_a + (size_t) sh_rows[threadIdx.x] * (p.I / 128) + chunk : nullptr;
+        if (!arrive_rows(nrows, sh_last, ctr, GPC * nproj * p.ksplit_a)) return;
+    }
     for (int r = 0; r < nrows; ++r)
-    for (int j = 0; j < CPB; ++j)
     {
         const int s = sh_rows[r];
-        const int chunk = (group * CPB + j) / GPC;
-        if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * p.ksplit_a, &sh_flag)) continue;
+        if (!sh_last[r]) continue;
         if (p.dbg & 1) continue;
         if (warp == 0)
         {
@@ -809,7 +830,6 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             had128(a0, a1, a2, a3, lane);
             store_h4(p.act_out + off, a0, a1, a2, a3);
         }
-        __syncthreads();
     }
 }
 
@@ -829,8 +849,6 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
     float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
-    __shared__ int sh_flag;
-    __shared__ int sh_n_active;
     __shared__ float sh_gate;
     __shared__ int sh_res[4];
     __shared__ int sh_rows[ROWS];
@@ -862,23 +880,28 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
     }
 
-    for (int r = 0; r < nrows; ++r)
-    for (int j = 0; j < CPB; ++j)
+    static_assert(CPB == 1, "batched arrivals assume one 128-column chunk per block");
+    __shared__ int sh_last[ROWS];
+    const int chunk = (group * CPB) / GPC;
     {
-        const int s = sh_rows[r];
-        const int row = s / p.topk;
-        const int chunk = (group * CPB + j) / GPC;
-
-        // Active slots of this token: the number of arrivals to expect for (row, chunk)
-        if (threadIdx.x == 0)
+        // Arrivals to expect for (row, chunk): the token's active slots
+        int* ctr = nullptr; int expected = 0;
+        if (threadIdx.x < nrows)
         {
+            const int row = sh_rows[threadIdx.x] / p.topk;
             int n = 0;
             for (int k = 0; k < p.topk; ++k)
                 n += slot_info(p, row * p.topk + k).active ? 1 : 0;
-            sh_n_active = n;
+            ctr = p.ctr_b + (size_t) row * (p.Ho / 128) + chunk;
+            expected = n * GPC * p.ksplit_b;
         }
-        __syncthreads();
-        if (!arrive_last(p.ctr_b + (size_t) row * (p.Ho / 128) + chunk, sh_n_active * GPC * p.ksplit_b, &sh_flag)) continue;
+        if (!arrive_rows(nrows, sh_last, ctr, expected)) return;
+    }
+    for (int r = 0; r < nrows; ++r)
+    {
+        const int s = sh_rows[r];
+        const int row = s / p.topk;
+        if (!sh_last[r]) continue;
         if (p.dbg & 2) continue;
 
         const int col = chunk * 128 + lane * 4;
