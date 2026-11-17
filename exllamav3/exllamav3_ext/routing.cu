@@ -303,6 +303,7 @@ static bool routing_gemv_rows_try(const at::Tensor& hidden, const at::Tensor& ga
     const int E = scores.size(-1);
     const int rows = hidden.numel() / k;
     if (rows < 2 || rows > RGEMV_MAX_ROWS || (k & 1) || !hidden.is_contiguous() || !scores.is_contiguous() ||
+        hidden.scalar_type() != at::kHalf || gate_t.scalar_type() != at::kHalf || scores.scalar_type() != at::kHalf ||
         scores.numel() != (int64_t) rows * E ||
         (((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.data_ptr()) & 3)) return false;
     const half* x = (const half*) hidden.data_ptr();
