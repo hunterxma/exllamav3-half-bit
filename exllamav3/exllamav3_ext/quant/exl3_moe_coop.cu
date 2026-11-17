@@ -159,7 +159,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     p.a_global = p.bsz > 1;
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
-    const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
+    // The down stage always takes the wide tile: its k (the intermediate width) is short, and narrow blocks there are
+    // mostly fixed cost (T5 on an RTX 5060 Ti, k = 512: 3,584 narrow blocks of ~10 KB each; the down launch per pass
+    // 1,250 -> 840 us wide). EXL3_MOE_COOP_WIDE (both stages) or EXL3_MOE_COOP_WIDE_B (down only) = 0 / 1 force it
+    static int wide_b_env = -2;
+    if (wide_b_env == -2) { const char* e = std::getenv("EXL3_MOE_COOP_WIDE_B"); wide_b_env = e ? atoi(e) : -1; }
+    const bool wide_b = wide_b_env >= 0 ? wide_b_env != 0 : (moe_coop_wide_mode() >= 0 ? moe_coop_wide_mode() != 0 : true);
     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
