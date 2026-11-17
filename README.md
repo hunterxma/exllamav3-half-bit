@@ -156,29 +156,30 @@ Our released half-bit model reaches 109.8 tok/s on the same card, but most of th
 settings.
 
 **Two GPUs** (RTX 3060 12 GB + RTX 5060 Ti 16 GB, Ryzen 5 3600, batch size 1). Our released half-bit model (24.51 GB,
-Qwen3.6-35B-A3B) fits whole in the two cards. The 3060 sits in a chipset slot (PCIe 2.0 x4); that costs nothing
-measurable at decode. Each step adds to the one above it; decode at 32k context, 8-bit cache:
+Qwen3.6-35B-A3B) fits whole in the two cards. Decode at 32k context, 8-bit cache; each step adds to the one above:
 
 | Setting | Decode |
 |---|---|
 | one RTX 5060 Ti, 104 experts per layer on the CPU, MTP 4 drafts | 114.7 tok/s |
-| both GPUs, 4 experts per layer on the CPU (the 112 second-rate experts of layers 8-29 still on the CPU) | 126 tok/s |
-| every expert on the GPUs: GPU rate tier | 151-160 tok/s |
+| both GPUs, 4 experts per layer on the CPU | 126 tok/s |
+| every expert on the GPUs (GPU rate tier) | 151-160 tok/s |
 | MTP 6 drafts instead of 4 | 170 tok/s |
-| more layers on the faster card (`-gs 8.8,15.0`) and a +150 MHz core offset on the 3060 | 180 tok/s |
+| more layers on the faster card, +150 MHz core on the 3060 | 180 tok/s |
 | one completion arrival per block in the decode MoE kernel | 186 tok/s |
-| both rates in one launch sequence | +1.5% (183 vs 180 tok/s in the same session) |
-| wide tile for the MoE down stage on Blackwell (the narrow one was mostly fixed cost at k = 512) | 190 tok/s |
+| both rates in one launch sequence | +1.5% |
+| wide tile for the MoE down stage | 190 tok/s |
 
-At 96k context the same setting decodes 150-180 tok/s and reads a 92k-token prompt at 1,514 tok/s (the CPU-split
-setting: 117-131 and 1,035). Peak VRAM at 96k: 10.2 of 12 GiB on the 3060, 15.0 of 15.9 GiB on the 5060 Ti.
+Clocks: 5060 Ti +350 MHz core / +5200 MHz memory, 3060 +150 / +2000, power capped at 170 W and 140 W. At stock
+clocks the same setting decodes 173 tok/s.
 
-Decode on these cards is limited by the arithmetic of the trellis decode, not memory bandwidth: lowering the core
-clock 31% made the MoE kernels 40-51% slower. The MoE and dense kernels both decode roughly 280-400 billion weights
-a second; the remaining kernel work is in fixed per-block costs, not the decode itself.
+At 96k context it decodes 150-180 tok/s and reads a 92k-token prompt at 1,514 tok/s. Peak VRAM at 96k: 10.2 of
+12 GiB on the 3060, 15.0 of 15.9 GiB on the 5060 Ti.
 
-`install.sh` in the model repository finds this setting on its own: it splits the model across every GPU, gives
-each card a VRAM budget and drafts 6 tokens when every expert fits on the GPUs.
+Decode on these cards is limited by the trellis arithmetic, not memory bandwidth: a 31% lower core clock made the
+MoE kernels 40-51% slower.
+
+`MODEL=/path/to/model bash install.sh` picks this setting on its own. A fresh clone on this machine decodes 187-192
+tok/s.
 
 ## Limitations
 
