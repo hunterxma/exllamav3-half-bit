@@ -265,11 +265,23 @@ export PATH=$CUDA_HOME/bin:$PATH
 CORES=$(nproc); RAM_GB=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)
 JOBS=${MAX_JOBS:-$(( CORES < RAM_GB / 3 ? CORES : RAM_GB / 3 ))}; [ "$JOBS" -ge 1 ] || JOBS=1
 LOG=$REPO/build.log
-say "building the extension for compute $ARCHS with $JOBS jobs (typically 10-30 min; log: $LOG)"
-if ! TORCH_CUDA_ARCH_LIST=$ARCHS MAX_JOBS=$JOBS "${PIP[@]}" --no-build-isolation -v "$REPO" > "$LOG" 2>&1; then
-  grep -m5 -E "error|Error|fatal" "$LOG" >&2 || true
-  grep -q -i "killed" "$LOG" && warn "a compiler process was killed (out of memory?): rerun with MAX_JOBS=$(( JOBS / 2 > 0 ? JOBS / 2 : 1 ))"
-  die "build failed; the first errors are above, full log in $LOG"
+# A rerun (e.g. with MODEL= to fit a model) skips the build when this venv already has the extension built from the
+# same commit, for the same GPUs and PyTorch (a git checkout without local changes; anything else always builds)
+STAMP=""
+if git -C "$REPO" rev-parse HEAD >/dev/null 2>&1 && [ -z "$(git -C "$REPO" status --porcelain -- exllamav3 setup.py 2>/dev/null)" ]; then
+  STAMP="$(git -C "$REPO" rev-parse HEAD) $ARCHS $("$VENV/bin/python" -c 'import torch; print(torch.__version__)')"
+fi
+if [ -n "$STAMP" ] && [ "$(cat "$VENV/.exl3_build" 2>/dev/null)" = "$STAMP" ] && \
+   "$VENV/bin/python" -c 'from exllamav3.ext import exllamav3_ext' 2>/dev/null; then
+  say "extension already built from this commit for compute $ARCHS; skipping the build"
+else
+  say "building the extension for compute $ARCHS with $JOBS jobs (typically 10-30 min; log: $LOG)"
+  if ! TORCH_CUDA_ARCH_LIST=$ARCHS MAX_JOBS=$JOBS "${PIP[@]}" --no-build-isolation -v "$REPO" > "$LOG" 2>&1; then
+    grep -m5 -E "error|Error|fatal" "$LOG" >&2 || true
+    grep -q -i "killed" "$LOG" && warn "a compiler process was killed (out of memory?): rerun with MAX_JOBS=$(( JOBS / 2 > 0 ? JOBS / 2 : 1 ))"
+    die "build failed; the first errors are above, full log in $LOG"
+  fi
+  [ -n "$STAMP" ] && echo "$STAMP" > "$VENV/.exl3_build"
 fi
 
 # JIT-compiled kernels (tests, extensions loaded at runtime) must use the same toolkit and host compiler as the build,
