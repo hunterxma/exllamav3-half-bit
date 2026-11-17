@@ -85,8 +85,9 @@ struct MoeCoopParams
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
 // 1 mcg, 2 mul1 codebook, uniform across the three projections
+// wait_b: an event the down stage waits for (the shared expert's output, produced on a side stream)
 void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
-                          float K_gu2 = 0.0f, float K_d2 = 0.0f);
+                          float K_gu2 = 0.0f, float K_d2 = 0.0f, cudaEvent_t wait_b = nullptr);
 
 // Static part of the parameter block, validated once from the module's tensors (BC construction);
 // K_gu / K_d / cb come back through the out-params. Gate tables/scratch are ignored when
@@ -123,7 +124,8 @@ void exl3_moe_coop_run
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out,
-    float K_gu2 = 0.0f, float K_d2 = 0.0f     // second rate of experts >= p.tier_first (p.tier_first > 0)
+    float K_gu2 = 0.0f, float K_d2 = 0.0f,    // second rate of experts >= p.tier_first (p.tier_first > 0)
+    cudaEvent_t wait_b = nullptr               // the down stage waits for it (sh_out written on a side stream)
 );
 
 // Tensor front end (prepare + run; the test entry point)

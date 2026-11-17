@@ -1,7 +1,9 @@
 #include <Python.h>
 #include "blocksparse_mlp.h"
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <map>
 #include <torch/extension.h>
 #include "../util.h"
 #include "../hgemm.cuh"
@@ -92,12 +94,41 @@ void BC_BlockSparseMLP::run_bszN
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
+    cudaEvent_t sh_join = nullptr;
     if (sh_coop)
     {
         // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
-        // the sigmoid gate, if any, is applied by the routed launch when it merges the result
+        // the sigmoid gate, if any, is applied by the routed launch when it merges the result.
+        // Its blocks fill a few SMs only, so it runs on a side stream alongside the routed rotation and gate/up
+        // stage; the routed down stage waits for it. EXL3_MOE_SH_OVERLAP=0 runs it first on the same stream.
+        // Expert-range shards keep the old order (their empty token rows read the shared output in the A stage)
+        static int ovl_env = -2;
+        if (ovl_env == -2) { const char* e = std::getenv("EXL3_MOE_SH_OVERLAP"); ovl_env = e ? atoi(e) : 1; }
+        const MoeCoopParams& rp = tier ? tier_p : coop_p;
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
+        if (ovl_env && rp.min_expert < 0)
+        {
+            const int dev = y.device().index();
+            cudaStream_t main = at::cuda::getCurrentCUDAStream(dev).stream();
+            static std::map<int, cudaStream_t> side_streams;
+            cudaStream_t& side = side_streams[dev];
+            if (!side) C10_CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+            if (!sh_ev_fork)
+            {
+                C10_CUDA_CHECK(cudaEventCreateWithFlags(&sh_ev_fork, cudaEventDisableTiming));
+                C10_CUDA_CHECK(cudaEventCreateWithFlags(&sh_ev_join, cudaEventDisableTiming));
+            }
+            C10_CUDA_CHECK(cudaEventRecord(sh_ev_fork, main));
+            C10_CUDA_CHECK(cudaStreamWaitEvent(side, sh_ev_fork, 0));
+            {
+                c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(side, dev));
+                exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
+            }
+            C10_CUDA_CHECK(cudaEventRecord(sh_ev_join, side));
+            sh_join = sh_ev_join;
+        }
+        else
+            exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
         sh_o = out_d_sh_n;
     }
     else if (shared_experts)
@@ -108,9 +139,9 @@ void BC_BlockSparseMLP::run_bszN
         sh_o = out_d_sh_n;
     }
     if (tier)
-        exl3_moe_coop_run(tier_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, tier_K_gu, tier_K_d);
+        exl3_moe_coop_run(tier_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, tier_K_gu, tier_K_d, sh_join);
     else
-        exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+        exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o, 0.0f, 0.0f, sh_join);
 }
 
 bool BC_BlockSparseMLP::attach_tier(std::shared_ptr<BC_BlockSparseMLP> _tier, int first)

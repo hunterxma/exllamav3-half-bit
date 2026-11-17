@@ -103,6 +103,9 @@ struct BC_BlockSparseMLP
     float sh_K_gu = 0, sh_K_d = 0; int sh_cb = 0;
     std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
     at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
+    // The shared expert's launches on a per-device side stream, forked at the start of run_bszN and joined before the
+    // routed down stage (the only consumer of its output), so they overlap the routed rotation and gate/up stage
+    cudaEvent_t sh_ev_fork = nullptr, sh_ev_join = nullptr;
 
 #if defined(USE_ROCM)
     // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN

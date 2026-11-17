@@ -141,7 +141,7 @@ static void moe_coop_smem_optin(void* kernel, int smem)
 }
 
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
-                          float K_gu2, float K_d2)
+                          float K_gu2, float K_d2, cudaEvent_t wait_b)
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
@@ -191,9 +191,13 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         const int rot_grid = CEIL_DIVIDE(rot_items, MOE_COOP_THREADS / 32);
         exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
     }
+    // The down stage's last arrivals merge the shared expert's output: when that is produced on a side stream, its
+    // event joins here, so the shared expert overlaps the rotation and the gate/up stage
+    auto join_b = [&] () { if (wait_b) cuda_check(cudaStreamWaitEvent(stream, wait_b, 0)); };
     if (!tier)
     {
         cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
+        join_b();
         cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
     }
     else
@@ -221,6 +225,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
             cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args1, ka.smem, stream));
             cuda_check(cudaLaunchKernel(ka2.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args2, ka2.smem, stream));
         }
+        join_b();
         if (!tier_b)
         {
             cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
@@ -358,7 +363,8 @@ void exl3_moe_coop_run
     MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out,
-    float K_gu2, float K_d2
+    float K_gu2, float K_d2,
+    cudaEvent_t wait_b
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -386,7 +392,7 @@ void exl3_moe_coop_run
     }
     else
         p.sh_gate_w = nullptr;
-    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, K_gu2, K_d2);
+    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, K_gu2, K_d2, wait_b);
 }
 
 void exl3_moe_coop
