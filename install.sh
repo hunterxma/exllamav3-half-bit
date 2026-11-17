@@ -14,8 +14,12 @@
 #   5. compiles a tiny kernel first (catches a host compiler nvcc does not accept and tries an older g++), then the
 #      extension for the GPUs in this machine only (minutes, not the hour an all-architecture build takes)
 #   6. runs the self-test (python -m exllamav3.util.selftest)
+#   7. with MODEL=<EXL3 model dir>: fits the model to this machine (examples/fit.py: every GPU, a VRAM budget per card,
+#      the fewest experts on the CPU, MTP drafts for that placement) and writes ./run.sh (chat) and ./serve.sh
+#      (OpenAI-compatible server) with those settings: the setting the README's benchmarks use
 #
 # Overrides: EXL3_VENV=path  CUDA_HOME=/usr/local/cuda-X.Y  TORCH_SPEC="torch==2.11.0"  MAX_JOBS=N
+#            MODEL=<EXL3 model dir> CTX=32768 (fit the model and write run.sh / serve.sh; step 7)
 #            EXL3_ARCH="8.6;12.0" (architectures to build)  EXL3_PIP_CUDA=1 (use the pip toolkit even if one is installed)
 #            EXL3_CUDA=12.8 (PyTorch CUDA family: 12.6, 12.8, 12.9 or 13.0; implies the pip toolkit)
 #            EXL3_NO_SELFTEST=1 (build only, e.g. while the GPU is busy)
@@ -114,7 +118,8 @@ else
     || say "no local CUDA toolkit this driver runs (found: ${cands[*]:-none}); NVIDIA's pip CUDA compiler will be installed in the venv"
 fi
 IDX=$(idx_of "$FAMILY")
-TORCH_SPEC=${TORCH_SPEC:-torch}
+# The PyTorch the benchmarks were measured with (TORCH_SPEC=torch takes the newest)
+TORCH_SPEC=${TORCH_SPEC:-torch==2.11.0}
 VENV=${EXL3_VENV:-$REPO/venv}
 if [ -n "${UV:-}" ]; then
   # cache and venv on different filesystems: copy (uv would warn on every install that hardlinking failed)
@@ -275,8 +280,47 @@ sed -i '/# EXL3 install.sh/,$d' "$VENV/bin/activate"
 
 # 7. Self-test
 MIN=$(( ($(date +%s) - T0) / 60 ))
-[ -n "${EXL3_NO_SELFTEST:-}" ] && { say "built in $MIN min; self-test skipped (EXL3_NO_SELFTEST). Run: $VENV/bin/python -m exllamav3.util.selftest"; exit 0; }
-say "self-test"
-"$VENV/bin/python" -m exllamav3.util.selftest || die "self-test failed (see above)"
+if [ -n "${EXL3_NO_SELFTEST:-}" ]; then
+  say "built in $MIN min; self-test skipped (EXL3_NO_SELFTEST). Run: $VENV/bin/python -m exllamav3.util.selftest"
+else
+  say "self-test"
+  "$VENV/bin/python" -m exllamav3.util.selftest || die "self-test failed (see above)"
+fi
+
+# 8. Optional: fit a model to this machine and write run.sh / serve.sh with the settings found
+if [ -n "${MODEL:-}" ]; then
+  MODEL=$(readlink -f "$MODEL"); CTX=${CTX:-32768}
+  [ -f "$MODEL/config.json" ] || die "MODEL=$MODEL: no config.json there"
+  "${PIP[@]}" -q transformers jinja2 >/dev/null   # serve.sh applies the model's chat template
+  say "fitting $MODEL to this machine (context $CTX, 8-bit cache)"
+  "$VENV/bin/python" "$REPO/examples/fit.py" "$MODEL" --ctx "$CTX" --out "$REPO/fit.json" || die "the model could not be fitted (see above)"
+  S=$("$VENV/bin/python" -c "import json; print(json.load(open('$REPO/fit.json'))['split'])")
+  A=$("$VENV/bin/python" -c "import json; print(' '.join(json.load(open('$REPO/fit.json'))['args']))")
+  D=$("$VENV/bin/python" -c "import json; print(json.load(open('$REPO/fit.json')).get('drafts', 4))")
+  G=$("$VENV/bin/python" -c "import json; print(json.load(open('$REPO/fit.json')).get('gs', 'auto'))")
+  ENV=$("$VENV/bin/python" -c "import json, shlex; print('\n'.join(f'export {k}={shlex.quote(v)}' for k, v in json.load(open('$REPO/fit.json'))['env'].items()))")
+  cat > "$REPO/run.sh" <<RUN
+#!/usr/bin/env bash
+# Chat with $MODEL as fitted by install.sh: $S experts per layer on the CPU, context $CTX, MTP $D drafts, VRAM budget $G
+export EXL3_MOE_CPU_SPLIT=$S
+$ENV
+# Thinking on (Qwen's default) unless -no_think is given, with Qwen's recommended sampling for each mode; arguments
+# given to run.sh override it
+MODE=(-think -temp_first -temp 1.0 -topp 0.95 -topk 20 -minp 0)
+for a in "\$@"; do [ "\$a" = -no_think ] && MODE=(-temp_first -temp 0.7 -topp 0.8 -topk 20 -minp 0); done
+exec "$VENV/bin/python" "$REPO/examples/chat.py" -m "$MODEL" -mode qwen35 $A "\${MODE[@]}" "\$@"
+RUN
+  cat > "$REPO/serve.sh" <<SERVE
+#!/usr/bin/env bash
+# OpenAI-compatible server (POST /v1/chat/completions, GET /health) for $MODEL with the settings install.sh found.
+#   ./serve.sh [--port 8000] [--host 127.0.0.1] [--api-key KEY]      (a repeated flag: the last one wins)
+export EXL3_MOE_CPU_SPLIT=$S
+$ENV
+exec "$VENV/bin/python" "$REPO/examples/server.py" -m "$MODEL" --port 8000 -c $CTX -cq 8 --chunk 2048 --draft $D \\
+  --draft-p-min 0.85 --sparse-head 16384 --gs $G "\$@"
+SERVE
+  chmod +x "$REPO/run.sh" "$REPO/serve.sh"
+  say "fitted: $S experts per layer on the CPU, MTP $D drafts, VRAM budget $G (fit.json). ./run.sh to chat, ./serve.sh for an API on port 8000"
+fi
 say "done in $MIN min. Activate with: source $VENV/bin/activate
     chat with an EXL3 model:  python examples/chat.py -m /path/to/model -mode <prompt format>  (python examples/chat.py -modes lists them)"

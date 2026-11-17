@@ -79,6 +79,10 @@ tensors:
 Run it like any EXL3 model, e.g. `python examples/chat.py -m /path/to/out -mode qwen35`. If the model is larger
 than your VRAM, `EXL3_MOE_CPU_SPLIT=N` runs N experts of every MoE layer on the CPU.
 
+For the settings the benchmarks below use, give the installer the model: `MODEL=/path/to/model bash install.sh`. It
+fits the model to your GPUs (all of them, fewest experts on the CPU, MTP drafts to match) and writes `run.sh` (chat)
+and `serve.sh` (OpenAI-compatible server).
+
 ## Does half a bit help?
 
 Qwen3.6-35B-A3B, KLD against BF16 on the same 30,149-token held-out set:
