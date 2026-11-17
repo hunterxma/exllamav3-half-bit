@@ -104,7 +104,7 @@ so treat this as "half bits make better allocations reachable", not a pure A/B o
 | CPU placement | `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer; a layer stored at two rates puts the smaller group on the CPU | identical output |
 | MTP drafting | `-dpm` confidence threshold, sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`) | same tokens / same output distribution |
 | GPU rate tier | a layer stored at two rates runs on the GPU in one fused decode launch sequence: one run table and rotation, a gate/up launch per rate, one per-token reduction (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it) | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
-| Decode MoE kernel | one completion arrival per block for all its rows (was one fence and up to three barriers per row) | identical output, 267 MoE kernel tests on sm_86 and sm_120 |
+| Decode MoE kernel | one completion arrival per block for all its rows (was one fence and up to three barriers per row); the down stage always on the wide tile | identical output, 267 MoE kernel tests on sm_86 and sm_120 |
 | Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
 | Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
 
@@ -164,6 +164,7 @@ measurable at decode. Each step adds to the one above it; decode at 32k context,
 | more layers on the faster card (`-gs 8.8,15.0`) and a +150 MHz core offset on the 3060 | 180 tok/s |
 | one completion arrival per block in the decode MoE kernel | 186 tok/s |
 | both rates in one launch sequence | +1.5% (183 vs 180 tok/s in the same session) |
+| wide tile for the MoE down stage on Blackwell (the narrow one was mostly fixed cost at k = 512) | 190 tok/s |
 
 At 96k context the same setting decodes 150-180 tok/s and reads a 92k-token prompt at 1,514 tok/s (the CPU-split
 setting: 117-131 and 1,035). Peak VRAM at 96k: 10.2 of 12 GiB on the 3060, 15.0 of 15.9 GiB on the 5060 Ti.
