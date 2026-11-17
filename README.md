@@ -103,6 +103,8 @@ so treat this as "half bits make better allocations reachable", not a pure A/B o
 | CPU experts | half rates on AVX2, AVX-512 and the scalar path; packed planar layout + prefetch on AVX2 | within 1.3% of the GPU result; bit-exact A/B |
 | CPU placement | `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer; a layer stored at two rates puts the smaller group on the CPU | identical output |
 | MTP drafting | `-dpm` confidence threshold, sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`) | same tokens / same output distribution |
+| GPU rate tier | a layer stored at two rates runs as two uniform-rate fused modules on the GPU (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it). T5 on two GPUs: 126 -> 151-160 tok/s at 32k | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
+| Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
 | Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
 
 Run the tests with `pytest tests/kernels/quant tests/kernels/moe tests/moe_cpu`.
