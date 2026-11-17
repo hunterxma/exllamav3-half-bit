@@ -41,6 +41,10 @@ EXL3_MOE_COOP_INST_DECL_H(7)
 
 #undef EXL3_MOE_COOP_INST_DECL_H
 
+// Both gate/up rates of a GPU rate tier in one launch (exl3_moe_coop_inst_dual.cu): K + 0.5 when h; nullptr kernel
+// for a pair without an instance
+MoeCoopKernel exl3_moe_coop_kernel_a_dual(int K1, bool h1, int K2, bool h2, int Hi, bool wide);
+
 #define EXL3_MOE_COOP_INST_DEF_H(K) \
     MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide) \
     { \

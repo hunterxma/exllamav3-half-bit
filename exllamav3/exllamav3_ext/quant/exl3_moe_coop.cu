@@ -200,13 +200,27 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     {
         // Each launch serves its own rate's runs (the rest exit at once); the per-slot gate/up counters belong to one
         // rate, and the down stage's per-token counters count every active slot, so the token's last arrival (in
-        // either down launch) sums both rates' slots
+        // either down launch) sums both rates' slots. A dual instance (exl3_moe_coop_inst_dual.cu) runs both gate/up
+        // rates in one launch instead; EXL3_MOE_COOP_DUAL=0 keeps the two launches
+        static int dual_env = -2;
+        if (dual_env == -2) { const char* e = std::getenv("EXL3_MOE_COOP_DUAL"); dual_env = e ? atoi(e) : 1; }
         MoeCoopParams p1 = p, p2 = p;
         p1.tier_only = 1; p2.tier_only = 2; p.tier_only = 0;
         void* args1[] = { (void*) &p1 };
         void* args2[] = { (void*) &p2 };
-        cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args1, ka.smem, stream));
-        cuda_check(cudaLaunchKernel(ka2.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args2, ka2.smem, stream));
+        const BitsK b1 = bits_from_K(K_gu), b2 = bits_from_K(K_gu2);
+        MoeCoopKernel kd = (dual_env && cb == 2) ? exl3_moe_coop_kernel_a_dual(b1.bits, b1.half, b2.bits, b2.half, p.Hi, wide_a)
+                                                 : MoeCoopKernel { nullptr, 0 };
+        if (kd.kernel)
+        {
+            moe_coop_smem_optin(kd.kernel, kd.smem);
+            cuda_check(cudaLaunchKernel(kd.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, kd.smem, stream));
+        }
+        else
+        {
+            cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args1, ka.smem, stream));
+            cuda_check(cudaLaunchKernel(ka2.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args2, ka2.smem, stream));
+        }
         if (!tier_b)
         {
             cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));

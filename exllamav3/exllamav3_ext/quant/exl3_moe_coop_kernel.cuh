@@ -699,8 +699,13 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 #endif
 template <int bits, bool HALF>
 constexpr int coop_minb() { return (bits <= 5 || (bits == 6 && !HALF)) ? MOE_COOP_MINB : 1; }
-template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS, coop_minb<bits, HALF>())
+// A GPU rate tier's two gate/up rates in one launch: bits2 > 0 gives the experts from p.tier_first on their own
+// (bits2, HALF2) tile, the rest (bits, HALF), so one grid covers every run of both rates (two launches left part of the
+// device idle at decode sizes: each filled only its own rate's share of the grid, one after the other)
+template <int bits, bool HALF, int bits2, bool HALF2>
+constexpr int coop_minb2() { return bits2 ? (coop_minb<bits, HALF>() < coop_minb<bits2, HALF2>() ? coop_minb<bits, HALF>() : coop_minb<bits2, HALF2>()) : coop_minb<bits, HALF>(); }
+template <int bits, int cb, bool WIDE, bool HALF = false, int bits2 = 0, bool HALF2 = false>
+__global__ __launch_bounds__(THREADS, (coop_minb2<bits, HALF, bits2, HALF2>()))
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
@@ -774,7 +779,15 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        if constexpr (bits2 > 0)
+        {
+            if (local >= p.tier_first)
+                gemv_tile<bits2, cb, WIDE, HALF2>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+            else
+                gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        }
+        else
+            gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
     }
 
     static_assert(CPB == 1, "batched arrivals assume one 128-column chunk per block");
