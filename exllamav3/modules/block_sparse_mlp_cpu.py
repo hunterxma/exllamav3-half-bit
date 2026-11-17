@@ -487,9 +487,14 @@ class BlockSparseMLP_CPU:
         on the CPU worker): shrinks the module to its GPU slice; the caller's normal load
         then loads that slice."""
         ip = self.config.infer_params
-        # EXL3_MOE_TIER_GPU=1: a layer whose experts are stored at two rates keeps both on the GPU (load_gpu_tier)
-        # instead of sending the second tier to the CPU worker; layers at one rate still take the split below
-        if os.environ.get("EXL3_MOE_TIER_GPU", "0") == "1" and self.load_gpu_tier(device):
+        # GPU rate tier (load_gpu_tier): a layer whose experts are stored at two rates keeps both on the GPU as two
+        # fused modules. Default (EXL3_MOE_TIER_GPU unset / "auto"): whenever this layer takes no CPU split, where the
+        # alternative is the dense per-expert path (measured on a two-tier Qwen3.6-35B layer: 7x faster at decode and
+        # 10x closer to an fp32 reference). "1" also when a split is set (the second tier stays off the CPU worker,
+        # one-rate layers still split); "0" never
+        tier = os.environ.get("EXL3_MOE_TIER_GPU", "auto")
+        if tier != "0" and (tier == "1" or not self._split_k_for(int(getattr(ip, "moe_cpu_split", 0)))) and \
+                self.load_gpu_tier(device):
             return
         # Registration shrinks the module to its GPU slice, then the normal load below loads
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
@@ -529,6 +534,14 @@ class BlockSparseMLP_CPU:
         ):
             if self.load_cpu_split(device, split_k, **kwargs):
                 ip.moe_cpu_split_assigned = getattr(ip, "moe_cpu_split_assigned", 0) + 1
+
+    def _split_k_for(self, split_k):
+        """The tail size cpu_maybe_split_load would apply to this layer (component override and split map included)"""
+        if getattr(self.config.infer_params, "moe_cpu_component", "text") != "text" and "EXL3_MOE_CPU_SPLIT_DRAFT" in os.environ:
+            split_k = int(os.environ["EXL3_MOE_CPU_SPLIT_DRAFT"])
+        if getattr(self.config.infer_params, "moe_cpu_component", "text") == "text" and os.environ.get("EXL3_MOE_CPU_SPLIT_MAP"):
+            split_k = int(_split_map_load().get(self.key, split_k))
+        return split_k
 
     def cpu_post_load(self):
         """After the module's tensors load on a CUDA device: apply the split placement
