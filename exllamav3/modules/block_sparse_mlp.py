@@ -649,7 +649,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
+        # (a GPU rate tier's second module adds into the first's row, so it keeps its own: _buf_suffix)
+        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn" + self._buf_suffix)
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -926,7 +927,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if device is not None and torch.device(device).type == "cuda":
             self.cpu_post_load()
             self.load_local(**kwargs)
-            self.load_routing(**kwargs)
+            if not self._is_tier:
+                self.load_routing(**kwargs)
 
 
     def _batch_recon_layer(self, y):
@@ -1124,7 +1126,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             z = y
 
-        if self.routing_gate is not None:
+        if self._is_tier:
+            # GPU rate tier module: the parent routed, its selection arrives with the call
+            selected_experts, routing_weights = params["moe_tier_routing"]
+        elif self.routing_gate is not None:
             selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
             if params.get("activate_all_experts") and "capture_qmaps" in params:
                 selected_experts, routing_weights = \
@@ -1667,6 +1672,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
+
+        # GPU rate tier (block_sparse_mlp_cpu.load_gpu_tier): the second-rate experts' partial sum, from the
+        # same fused kernels in their own module
+        if self._tier is not None:
+            final_hidden_states = final_hidden_states.view(eshape)
+            final_hidden_states += self._tier.forward(
+                y, dict(params, moe_tier_routing = (selected_experts, routing_weights))).view(eshape)
 
         # Independent shared-expert work can cover the CPU job (split tail or whole layer)
         # before collect enqueues its stream wait. Fused shared experts have already run

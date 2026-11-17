@@ -451,6 +451,10 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        self._tier = None             # GPU rate tier: module holding the layer's second-rate experts (load_gpu_tier)
+        self._tier_saved = None
+        self._is_tier = False         # this module IS such a tier (routed by its parent)
+        self._buf_suffix = ""
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -483,6 +487,10 @@ class BlockSparseMLP_CPU:
         on the CPU worker): shrinks the module to its GPU slice; the caller's normal load
         then loads that slice."""
         ip = self.config.infer_params
+        # EXL3_MOE_TIER_GPU=1: a layer whose experts are stored at two rates keeps both on the GPU (load_gpu_tier)
+        # instead of sending the second tier to the CPU worker; layers at one rate still take the split below
+        if os.environ.get("EXL3_MOE_TIER_GPU", "0") == "1" and self.load_gpu_tier(device):
+            return
         # Registration shrinks the module to its GPU slice, then the normal load below loads
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
@@ -528,7 +536,7 @@ class BlockSparseMLP_CPU:
         # Split placement permutation: move the router (and per-expert routing tensors)
         # into the same hot-to-cold expert order the weight lists were rearranged into.
         # gate_tensor is (hidden, E), logits = y @ W: permute columns
-        if self.cpu_split_first is not None and self._split_perm is not None:
+        if (self.cpu_split_first is not None or self._tier is not None) and self._split_perm is not None:
             perm_t = torch.tensor(self._split_perm, device = self.routing_gate.inner.weight.device)
             ig = self.routing_gate.inner
             ig.weight = ig.weight[:, perm_t].contiguous()
@@ -565,6 +573,12 @@ class BlockSparseMLP_CPU:
             register_split_module(self.config.infer_params, self)
 
     def cpu_unload(self):
+        if self._tier_saved is not None:
+            (self.gates, self.ups, self.downs, self.modules,
+             self.num_local_experts, self.routing_first, self.routing_last) = self._tier_saved
+            self._tier_saved = None
+            self._tier = None
+            self._split_perm = None
         if self.cpu_split_first is not None:
             host = getattr(self, "cpu_host", None)
             if host is not None:
@@ -699,7 +713,84 @@ class BlockSparseMLP_CPU:
         EXL3_MOE_CPU_SPLIT_STATS file). cpu_post_load then permutes the router tensors right
         after they load, so those must be filled eagerly even inside a deferred-load bracket;
         the rest of the module (every GPU-resident expert) keeps the batched deferred fill"""
-        return self.cpu_split_first is not None and getattr(self, "_split_perm", None) is not None
+        return (self.cpu_split_first is not None or self._tier is not None) and \
+            getattr(self, "_split_perm", None) is not None
+
+    def load_gpu_tier(self, device) -> bool:
+        """
+        GPU rate tier: a build may store a layer's experts at two bitrates. The fused GPU kernels take one rate per
+        projection, so loaded whole such a layer falls back to the dense per-expert path (slow at decode), and the
+        CPU split sends the second tier to the worker. Here both tiers stay on the GPU instead: the experts are
+        permuted so the smaller tier sorts last (the router follows in cpu_post_load), this module shrinks to the
+        [0, first) slice and a second BlockSparseMLP holds [first, E), each a uniform-rate module on every fused
+        path. forward() runs the second one on the same routing and adds its partial sum. Returns False (no side
+        effects) for a layer at one rate or one this does not cover.
+        """
+        if (
+            self._tier is not None or self._is_tier or self.cpu_split_first is not None or
+            device is None or torch.device(device).type != "cuda" or
+            self.num_local_experts != self.num_experts or self.routing_first is not None or
+            self.tid2eid_key or self.latent_in is not None or not self.gates and self.gated
+        ):
+            return False
+        stc = self.config.stc
+        def rates(e):
+            return tuple(stc.list_tensors(l.key)[l.key + ".trellis"]["shape"][-1]
+                         for l in (([self.gates[e]] if self.gated else []) + [self.ups[e], self.downs[e]]))
+        try:
+            er = [rates(e) for e in range(self.num_experts)]
+        except (KeyError, TypeError):
+            return False
+        tiers = sorted(set(er), key = lambda r: (sum(1 for x in er if x == r), sum(r)))
+        if len(tiers) != 2:
+            return False
+        low = [r == tiers[0] for r in er]
+        perm = sorted(range(self.num_experts), key = lambda e: low[e])
+        first = self.num_experts - sum(low)
+
+        self._tier_saved = (self.gates, self.ups, self.downs, self.modules,
+                            self.num_local_experts, self.routing_first, self.routing_last)
+        self._split_perm = perm
+        gates = [self.gates[e] for e in perm] if self.gated else []
+        ups = [self.ups[e] for e in perm]
+        downs = [self.downs[e] for e in perm]
+        tail = set(gates[first:] + ups[first:] + downs[first:])
+
+        from .block_sparse_mlp import BlockSparseMLP
+        t = BlockSparseMLP(
+            config = self.config,
+            key = self.key + ".tier",
+            hidden_size = self.hidden_size,
+            intermediate_size = self.intermediate_size,
+            num_experts = self.num_experts,
+            num_experts_per_tok = self.num_experts_per_tok,
+            num_local_experts = self.num_experts - first,
+            key_e_score_bias = None,
+            activation_fn = self.activation_fn,
+            act_limit = self.act_limit,
+            interm_dtype = self.interm_dtype,
+            gates = gates[first:],
+            ups = ups[first:],
+            downs = downs[first:],
+            routing_first = first,
+            routing_last = self.num_experts,
+        )
+        for l in gates[first:] + ups[first:] + downs[first:]:
+            t.register_submodule(l)
+        t._is_tier = True
+        t._buf_suffix = ".tier"
+        self._tier = t
+
+        self.gates = gates[:first]
+        self.ups = ups[:first]
+        self.downs = downs[:first]
+        self.modules = [m for m in self.modules if m not in tail] + [t]
+        self.num_local_experts = first
+        self.routing_first = 0
+        self.routing_last = first
+        print(f" -- GPU rate tier: {self.key} experts [{first}..{self.num_experts}) at the second rate, "
+              f"own fused module")
+        return True
 
     def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
         """
