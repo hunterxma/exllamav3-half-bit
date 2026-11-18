@@ -90,11 +90,14 @@ Qwen3.6-35B-A3B, KLD against BF16 on the same 30,149-token held-out set:
 | Build | Rates | Size | KLD mean | Same top-1 |
 |---|---|---|---|---|
 | integer rates only | 4-8 | 24.61 GB | 0.0166 | 97.4% |
-| half-bit rates, 4.5 in the middle layers | 4.5-8 | 23.87 GB | 0.0157 | 97.2% |
-| half-bit rates + rate tiers (our released model) | 4.5-8 | 24.51 GB | 0.0156 | 97.4% |
+| half-bit rates, 4.5 in the middle layers ([T5 FV](https://huggingface.co/HydraAiM/Qwen3.6-35B-A3B-EXL3-HalfRate-T5-FV)) | 4.5-8 | 23.87 GB | 0.0157 | 97.2% |
+| half-bit rates + rate tiers ([T5](https://huggingface.co/HydraAiM/Qwen3.6-35B-A3B-EXL3-HalfRate-T5)) | 4.5-8 | 24.51 GB | 0.0156 | 97.4% |
 
 The half-bit builds come out smaller and closer to BF16. The allocations differ in more than just the half steps,
 so treat this as "half bits make better allocations reachable", not a pure A/B of the rate itself.
+
+Both half-bit builds are on Hugging Face: [EXL3 Half-Rate T5](https://huggingface.co/HydraAiM/Qwen3.6-35B-A3B-EXL3-HalfRate-T5) (closest to BF16) and
+[EXL3 Half-Rate T5 FV](https://huggingface.co/HydraAiM/Qwen3.6-35B-A3B-EXL3-HalfRate-T5-FV) (0.6 GB smaller, about 15% faster). Their model cards have benchmarks and install steps.
 
 ## What's changed
 
