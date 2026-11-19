@@ -433,8 +433,15 @@ def main(args):
         logits = []
         if streaming:
             states = rows
+            # Keep only the boundaries the fan-out reads (each target module's input, and the next
+            # module's for the injected-error figure): every boundary is rows x length x hidden fp32,
+            # so all of them pinned ~22 GB of RAM for a 64-layer, 5120-wide model at 8 x 2048
+            try:
+                keep = {j for i in targets_by_idx for j in (i, i + 1)}
+            except NameError:   # early reference pass for expert tiers: targets not collected yet
+                keep = None
             for i in range(num_mods):
-                boundary[i] = states
+                boundary[i] = states if keep is None or i in keep else None
                 with runner.loaded(i) as mod:
                     states = runner.rows(
                         mod, states, ids = rows, extra = {"route_counts": route_counts},
@@ -847,7 +854,7 @@ def main(args):
         measurements_by_idx = {idx: 1 + sum(len(measurement_plan(t)) for t in ts)
                               for idx, ts in todo_by_idx.items()}
         state_bytes = max((sum(t.numel() * t.element_size() for t in states)
-                           for states in boundary[1:]), default = 0)
+                           for states in boundary[1:] if states is not None), default = 0)
         budget = sysmem_budget(args.max_sys)
         passes = plan_fanout_passes(measurements_by_idx, state_bytes, budget)
         peak = max((sum(measurements_by_idx[i] for i in p) for p in passes), default = 0)
