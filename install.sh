@@ -23,6 +23,7 @@
 #            EXL3_ARCH="8.6;12.0" (architectures to build)  EXL3_PIP_CUDA=1 (use the pip toolkit even if one is installed)
 #            EXL3_CUDA=12.8 (PyTorch CUDA family: 12.6, 12.8, 12.9 or 13.0; implies the pip toolkit)
 #            EXL3_NO_SELFTEST=1 (build only, e.g. while the GPU is busy)
+#            EXL3_TESTS=1 (also install the test suite's packages: pytest, transformers, accelerate)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 REPO=$PWD
@@ -260,6 +261,7 @@ say "CUDA compiler: $CUDA_HOME ($("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*
 export PATH=$CUDA_HOME/bin:$PATH
 "${PIP[@]}" -q setuptools wheel ninja
 "${PIP[@]}" -q -r "$REPO/requirements_examples.txt"   # examples/chat.py and friends work straight after install
+[ -n "${EXL3_TESTS:-}" ] && "${PIP[@]}" -q -r "$REPO/requirements_tests.txt"   # pytest suite (see README)
 
 # 6. Build for these GPUs only. RAM bounds parallelism: each nvcc job can take ~3 GB
 CORES=$(nproc); RAM_GB=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)

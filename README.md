@@ -36,6 +36,7 @@ only and runs a self-test over every bitrate. Expect 15-40 minutes, almost all o
 | `MAX_JOBS` | parallel compile jobs (default: by RAM) |
 | `TORCH_SPEC`, `EXL3_VENV` | PyTorch version, venv location |
 | `EXL3_NO_SELFTEST=1` | build only |
+| `EXL3_TESTS=1` | also install the test suite's packages |
 
 Clean-environment installs (empty home directory, no CUDA toolkit), RTX 5060 Ti (sm_120), driver 595:
 
@@ -109,7 +110,12 @@ Both half-bit builds are on Hugging Face: [EXL3 Half-Rate T5](https://huggingfac
 | Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
 | Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
 
-Run the tests with `pytest tests/kernels/quant tests/kernels/moe tests/moe_cpu`.
+Run the tests (a rerun of the installer skips the build):
+
+```bash
+EXL3_TESTS=1 bash install.sh
+./venv/bin/python -m pytest tests/kernels/quant tests/kernels/moe tests/moe_cpu
+```
 
 ## Benchmarks
 
