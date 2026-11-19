@@ -99,10 +99,24 @@ class gc_paused:
         return False
 
 
+# Return torch's idle cached blocks to the driver, safely with several devices. With expandable
+# segments the release unmaps the idle pages, and a block freed in Python can still be in use by work
+# queued on its stream (frees are stream-ordered); torch does not wait for that queued work on the
+# other devices, so a kernel still in flight there faults on the unmapped pages (two GPUs, batch
+# warm-up: Warp MMU fault in a reconstruct on the second card). Syncing every device that holds
+# cached memory first makes the release safe; callers are rare (load, a new attention graph slot)
+def empty_cache():
+    if torch.cuda.is_initialized():
+        for d in range(torch.cuda.device_count()):
+            if torch.cuda.memory_reserved(d):
+                torch.cuda.synchronize(d)
+    torch.cuda.empty_cache()
+
+
 # Free unused VRAM
 def free_mem():
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
 
 # Host-allocation churn (recurrent checkpoint stashes, per-layer fp32 copies during

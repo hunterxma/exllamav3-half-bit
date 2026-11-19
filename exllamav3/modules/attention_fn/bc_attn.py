@@ -7,6 +7,7 @@ from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
 from .smem import smem_limit
+from ...util.memory import empty_cache
 
 """
 Graph-captured decode attention (BC_Attention): the whole attention block for a decode step --
@@ -640,7 +641,7 @@ class BCAttn:
             # can first appear mid-generation (MTP verify after a prompt), when torch's cache holds most of the
             # free device memory in idle blocks: a 24.5 GB model at split 104 left 79 MiB beside ~320 MiB cached-but-unused
             # and the capture OOM'd. Returning the idle blocks first is cheap (once per slot)
-            torch.cuda.empty_cache()
+            empty_cache()   # syncs every device first (multi-GPU + expandable segments)
         # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
         # loads); the block table is the only one bound per call rather than a whole static, and
         # the generator uploads it fresh each step. A caller passing a row slice of a device
