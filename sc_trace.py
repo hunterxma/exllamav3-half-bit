@@ -707,8 +707,42 @@ def main(args):
     def total_packed():
         return total_in + total_out
 
+    stop_file = args.output + ".stop"
+    committed = set()
+
+    def commit(convs, c_idx, p, t_idx, epoch):
+        """Record one finished prefix job right away (prefix mode has one turn per conversation), so a
+        partial trace survives an early stop"""
+        nonlocal total_in, total_out
+        chunks = p["chunks"]
+        response_ids = torch.cat(chunks, dim = -1)[0] if chunks else torch.empty(0, dtype = torch.long)
+        conv = convs[c_idx]
+        committed.add(c_idx)
+        if response_ids.numel() == 0:
+            conv["alive"] = False
+            return
+        rows.append({
+            "conversation": c_idx, "turn": t_idx, "epoch": epoch, "eos_reason": p["eos_reason"],
+            "input_ids": p["input_ids"][0].tolist(), "response_ids": response_ids.tolist(),
+            "source": conv["source"],
+        })
+        total_in += p["input_ids"].shape[-1]
+        total_out += response_ids.numel()
+
+    def save_partial():
+        tmp = args.output + ".partial.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"model": args.model_dir, "vocab_size": tokenizer.actual_vocab_size,
+                       "template_vars": TEMPLATE_VARS, "partial": True,
+                       "meta": {"rows": len(rows), "input_tokens": total_in, "output_tokens": total_out},
+                       "rows": rows}, f)
+        os.replace(tmp, args.output + ".partial")
+
+    stopped = False
     with ProgressBar("Sampling", target_tokens) as pb:
         for epoch in range(args.max_epochs):
+            if stopped:
+                break
             if total_packed() >= target_tokens:
                 break
             convs = [{"messages": [], "turns": [seed] + fu, "alive": True}
@@ -722,8 +756,9 @@ def main(args):
             # small token target still spreads across all domains, and follow-up turns only need
             # the previous wave's responses
             for t_idx in range(max_turns):
-                if total_packed() >= target_tokens:
+                if total_packed() >= target_tokens or stopped:
                     break
+                committed.clear()     # per wave: conversation indices repeat across waves and epochs
                 pending = {}    # c_idx -> {"input_ids", "chunks", "eos_reason"}
                 for c_idx, conv in enumerate(convs):
                     if not conv["alive"] or t_idx >= len(conv["turns"]):
@@ -769,9 +804,25 @@ def main(args):
                                   f"{col_yellow}{n_new:5}{col_default} tokens "
                                   f"({p['eos_reason']})   total "
                                   f"{col_green}{total_packed() + wave_tokens:8,}{col_default}")
+                            c_idx = result["identifier"]
+                            if "prefix_ids" in convs[c_idx]:
+                                commit(convs, c_idx, p, t_idx, epoch)
+                                wave_tokens -= n_new + p["input_ids"].shape[-1]   # now counted in total_in/out
+                                if len(rows) % 50 == 0:
+                                    save_partial()
                     pb.update(min(total_packed() + wave_tokens, target_tokens))
+                    if os.path.exists(stop_file):
+                        # Early stop (touch <output>.stop): drop unfinished jobs, keep every finished one
+                        print(f" -- Stop file found: {len(committed)} finished, cancelling {generator.num_remaining_jobs()} jobs")
+                        generator.clear_queue()
+                        stopped = True
+                        break
+                if stopped:
+                    pending = {}
 
                 for c_idx, p in pending.items():
+                    if c_idx in committed:
+                        continue
                     conv = convs[c_idx]
                     chunks = p["chunks"]
                     response_ids = torch.cat(chunks, dim = -1)[0] if chunks \
