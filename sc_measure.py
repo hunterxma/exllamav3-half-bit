@@ -3,6 +3,7 @@ import sys, os
 import argparse
 import json
 import math
+import re
 import zlib
 from collections import defaultdict
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from exllamav3.modules.attn import Attention
 from exllamav3.modules.sliding_attn import SlidingAttention
 from exllamav3.modules.gated_delta_net import GatedDeltaNet
 from exllamav3.modules.quant.fp16 import LinearFP16
+from exllamav3.modules.quant.exl3 import LinearEXL3
 from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k
 
 """
@@ -195,11 +197,12 @@ class Target:
     single K instead of the mixed-K fallback, and it keeps the fan-out at a handful of targets
     per layer instead of hundreds."""
 
-    def __init__(self, key, linears, qbits_key):
+    def __init__(self, key, linears, qbits_key, slice = None):
         self.key = key
         self.linears = linears
         self.qbits_key = qbits_key
         self.members = [lin.key for lin in linears]
+        self.slice = slice      # (dim, a, b) of a single Linear's (in, out) weight: --slice targets (one head)
 
     @property
     def grouped(self):
@@ -209,7 +212,7 @@ class Target:
         return sum(lin.weights_numel() for lin in self.linears)
 
 
-def collect_targets(mod, tiers=None):
+def collect_targets(mod, tiers=None, ungroup=False, slices=()):
     """Targets under one top-level module: the routed experts of each BlockSparseMLP as one
     grouped target (its routing gate and latent projections stay individual); the gate and up
     projections of each GatedMLP (dense MLPs and MoE shared experts alike) as one grouped target,
@@ -221,6 +224,8 @@ def collect_targets(mod, tiers=None):
     grouped_ids = set()
 
     def group(m, name, linears):
+        if ungroup:     # --ungroup: every Linear its own target (q, k, v, gate, up measured apart)
+            return
         linears = [lin for lin in linears if lin is not None and lin.qmap is not None and id(lin) not in grouped_ids]
         if len(linears) > 1:
             targets.append(Target(f"{m.key}.{name}", linears, linears[0].qbits_key))
@@ -256,6 +261,13 @@ def collect_targets(mod, tiers=None):
             group(m, "gate_up", m.gates + m.ups)
         if isinstance(m, Linear) and m.qmap is not None and id(m) not in grouped_ids:
             targets.append(Target(m.key, [m], m.qbits_key))
+            for pat, dim, count in slices:      # --slice: also one target per equal block (head) of this Linear
+                if re.search(pat, m.key):
+                    size = (m.in_features if dim == 0 else m.out_features)
+                    assert size % count == 0, f"{m.key}: dim {dim} size {size} not divisible by {count}"
+                    step = size // count
+                    for j in range(count):
+                        targets.append(Target(f"{m.key}#{dim}.{j}", [m], m.qbits_key, (dim, j * step, (j + 1) * step)))
         for ch in getattr(m, "modules", []):
             walk(ch)
 
@@ -457,6 +469,27 @@ def main(args):
 
     import re
     target_filter = re.compile(args.targets) if args.targets else None
+    slices = []
+    for spec in (args.slice or []):         # "regex:dim:count", e.g. "o_proj$:0:24" = one target per attention head
+        pat, dim, count = spec.rsplit(":", 2)
+        slices.append((pat, int(dim), int(count)))
+    assert not slices or args.real, "--slice needs --real (noise models are whole-tensor)"
+
+    # --real: the perturbation is the build's own decoded quantization error W_q - W (scaled to each
+    # level), not synthetic noise. Levels come from --rfn_ref (sc_rfn_probe.py of the same build), so
+    # scale 1.0 reproduces the build's tensor exactly and 0.5 stands in for one more bit
+    real = None
+    if args.real:
+        assert args.rfn_ref, "--real needs --rfn_ref from sc_rfn_probe.py of the same build"
+        assert not args.shaped, "--real replaces the noise model; drop --shaped"
+        real_config = Config.from_directory(args.real)
+        real_model = Model.from_config(real_config)
+        real_key_idx = {}
+        def _walk_keys(m, i):
+            real_key_idx[m.key] = i
+            for ch in getattr(m, "modules", []): _walk_keys(ch, i)
+        for i, m in enumerate(real_model.modules): _walk_keys(m, i)
+        real = dict(config = real_config, model = real_model, key_idx = real_key_idx, loaded = None)
 
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
     # layer's routed experts as one grouped target (or one per tier and projection)
@@ -464,7 +497,7 @@ def main(args):
     num_targets = 0
     num_grouped = 0
     for i in range(num_mods):
-        for t in collect_targets(mods[i], tiers):
+        for t in collect_targets(mods[i], tiers, args.ungroup, slices):
             if target_filter is not None and not target_filter.search(t.key):
                 continue
             if not streaming:
@@ -642,6 +675,47 @@ def main(args):
     SAVED_ON_HOST_BYTES = 1 << 30      # grouped targets park their saved weights in host RAM past this
 
     @torch.inference_mode()
+    @torch.inference_mode()
+    def real_weight(lin):
+        """The build's decoded weight for lin (in, out), keeping one top-level build module resident."""
+        idx = real["key_idx"][lin.key]
+        if real["loaded"] != idx:
+            if real["loaded"] is not None:
+                real["model"].modules[real["loaded"]].unload()
+                torch.cuda.empty_cache()
+            m = real["model"].modules[idx]
+            real["config"].stc.begin_deferred_load()
+            m.load(lin.inner.weight.device)
+            real["config"].stc.end_deferred_load()
+            real["loaded"] = idx
+        def find(m):
+            if m.key == lin.key: return m
+            for ch in getattr(m, "modules", []):
+                r = find(ch)
+                if r is not None: return r
+        q = find(real["model"].modules[idx])
+        assert q is not None and isinstance(q.inner, LinearEXL3), f"{lin.key}: not an EXL3 tensor in --real build"
+        return q.inner.get_weight_tensor()
+
+    @torch.inference_mode()
+    def perturb_real(lin, rfn, sl):
+        """w += alpha (W_q - w) with alpha set so the realized error over the tensor (or its slice) has
+        ||dW|| = rfn * ||W||. Returns (saved, realized rfn, ||W||) over the slice."""
+        w = lin.inner.weight
+        wq = real_weight(lin)
+        assert wq.shape[0] >= w.shape[0] and wq.shape[1] >= w.shape[1], f"{lin.key}: {tuple(wq.shape)} vs {tuple(w.shape)}"
+        wq = wq[: w.shape[0], : w.shape[1]]
+        saved = w.clone()
+        view = (lambda x: x) if sl is None else (lambda x: x.narrow(sl[0], sl[1], sl[2] - sl[1]))
+        ws, qs = view(w), view(wq)
+        w_sq = ws.float().square().sum().item()
+        d_sq = (qs.float() - ws.float()).square().sum().item()
+        alpha = rfn * math.sqrt(w_sq / max(d_sq, 1e-30))
+        ws.copy_((ws.float() + alpha * (qs.float() - ws.float())).to(w.dtype))
+        err_sq = (ws.float() - view(saved).float()).square().sum().item()
+        del wq
+        return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5
+
     def perturb_target(target, li, draw, shaping):
         """Perturb every member of a target at its own level (seeded per member, so single-Linear
         targets reproduce the ungrouped seeds). Returns (saved list, realized rfn over the whole
@@ -653,7 +727,9 @@ def main(args):
         for lin, rfn in zip(target.linears, per):
             seed = zlib.crc32(f"{lin.key}|{li}|{draw}".encode()) & 0x7fffffff
             shape_lin = shaping.get(lin.qmap) if args.shaped else None
-            if shape_lin is not None:
+            if real is not None:
+                sv, rfn_actual, w_norm = perturb_real(lin, rfn, target.slice)
+            elif shape_lin is not None:
                 factors = tuple(t.to(lin.inner.weight.device) for t in shape_lin)
                 sv, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
                 del factors
@@ -962,6 +1038,9 @@ if __name__ == "__main__":
     parser.add_argument("-ms", "--max-sys", dest = "max_sys", type = float, default = None,
                         help = "Streaming: system RAM for pending fan-out states, in GB (default: half of what is available)")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
+    parser.add_argument("--real", type = str, default = None, help = "EXL3 build dir: perturb with its real decoded error (W_q - W) scaled to each level; needs --rfn_ref of that build")
+    parser.add_argument("--ungroup", action = "store_true", help = "Measure every Linear alone (q/k/v and gate/up apart instead of as one bundle)")
+    parser.add_argument("--slice", action = "append", default = None, help = "regex:dim:count - extra targets, one per equal block of matching Linears along dim (0 = in, 1 = out), e.g. one per head; repeatable")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
     parser.add_argument("-rfn", "--rfn", type = str, default = "0.29,0.145", help = "Comma-separated global noise levels (relative weight Frobenius norm)")
