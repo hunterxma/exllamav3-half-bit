@@ -2,7 +2,7 @@
 """
 Fit an EXL3 MoE model to this machine: the smallest number of experts per layer to run on the CPU worker
 (EXL3_MOE_CPU_SPLIT) at which the model loads with the requested context and generates. With more than one GPU the
-model is split across all of them (PCI bus order, a VRAM budget per card: its free memory less a reserve, the reserve
+model is split across all of them (PCI bus order; CUDA_VISIBLE_DEVICES limits the cards; a VRAM budget per card: its free memory less a reserve, the reserve
 raised before any expert moves to the CPU), and a model that fits whole runs every expert on the GPUs (layers stored at
 two bitrates as two fused modules, exllamav3's GPU rate tier). Starts from an estimate
 (free VRAM vs the model's expert and non-expert bytes), then moves 8 experts per layer to the CPU per failed attempt,
@@ -60,11 +60,24 @@ if args.attempt:   # one load + generation in this process; prints a JSON line
                       "vram_mib": torch.cuda.max_memory_reserved() // 2**20}))
     sys.exit(0)
 
-def smi(q):   # one line per GPU, nvidia-smi's (PCI bus) order
-    return [l.strip() for l in subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
-                                              capture_output = True, text = True).stdout.splitlines() if l.strip()]
+# Device order for the fit and for run.sh / serve.sh: PCI bus order (nvidia-smi's numbering) unless the user set one
+DEVICE_ORDER = os.environ.get("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-names, frees = smi("name"), [int(x) for x in smi("memory.free")]
+def visible_gpus():
+    """[(name, free MiB)] of the GPUs the runs will see, in their CUDA order. Asks CUDA in a child process with the
+    runs' device order, so CUDA_VISIBLE_DEVICES is respected (nvidia-smi always lists every GPU)."""
+    code = ("import json, torch; print(json.dumps([[torch.cuda.get_device_name(i), torch.cuda.mem_get_info(i)[0] >> 20]"
+            " for i in range(torch.cuda.device_count())]))")
+    r = subprocess.run([sys.executable, "-c", code], env = dict(os.environ, CUDA_DEVICE_ORDER = DEVICE_ORDER),
+                       capture_output = True, text = True)
+    line = next((l for l in reversed(r.stdout.splitlines()) if l.startswith("[")), None)
+    if r.returncode != 0 or not line or not json.loads(line):
+        sys.exit("no CUDA GPU visible" + (f" (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})"
+                                          if "CUDA_VISIBLE_DEVICES" in os.environ else "")
+                 + (f": {r.stderr.strip().splitlines()[-1]}" if r.stderr.strip() else ""))
+    return json.loads(line)
+
+names, frees = map(list, zip(*visible_gpus()))
 gpu, free_mib = " + ".join(names), sum(frees)
 multi = len(frees) > 1
 RESERVES = [1.6, 2.1, 2.6, 3.0] if multi else [None]   # GiB per card left outside the budget (cache, activations)
@@ -92,8 +105,10 @@ def runtime_env():
     EXL3_MOE_CPU_SPLIT_STATS: per-layer routing counts; each layer keeps its most-used experts on the GPU.
     EXL3_MOE_PINNED_ARENA=1: CPU experts in a shared arena, a hot expert is moved to the GPU when it is missed.
     Layers whose experts are stored at two rates put the smaller group on the CPU (fixed by the model)."""
-    env = {"EXL3_MOE_CPU_SPLIT_DRAFT": "0", "EXL3_MOE_PINNED_ARENA": "1"}
-    if multi: env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # CUDA device i = nvidia-smi line i (the budgets' order)
+    env = {"EXL3_MOE_CPU_SPLIT_DRAFT": "0", "EXL3_MOE_PINNED_ARENA": "1",
+           "CUDA_DEVICE_ORDER": DEVICE_ORDER}   # CUDA device i = the budgets' card i
+    if "CUDA_VISIBLE_DEVICES" in os.environ:   # run.sh / serve.sh use the GPUs the fit used
+        env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
     stats = os.path.join(os.path.abspath(args.model), "expert_stats.json")
     if os.path.exists(stats): env["EXL3_MOE_CPU_SPLIT_STATS"] = stats
     env.update({k: os.environ[k] for k in ("EXL3_MOE_CPU_SPLIT_DRAFT", "EXL3_MOE_PINNED_ARENA", "EXL3_MOE_CPU_SPLIT_STATS")
