@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Problems that also happen on stock exllamav3
+    url: https://github.com/turboderp-org/exllamav3/issues
+    about: Report those upstream; this fork only covers the half-bit changes.

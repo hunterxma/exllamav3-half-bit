@@ -1,11 +1,3 @@
----
-license: mit
-library_name: exllamav3
-tags:
-  - exllamav3
-  - exl3
----
-
 # exllamav3 with half-bit rates (4.5 to 7.5 bpw)
 
 A fork of [turboderp's exllamav3](https://github.com/turboderp-org/exllamav3) v1.6.6, not affiliated with upstream.
@@ -200,7 +192,9 @@ Found a problem? Open an issue here with your GPU, driver version and the instal
 
 ---
 
-Everything below this section is upstream's README.
+Everything below this section is upstream's README. Its install commands (release wheels, PyPI,
+`git clone turboderp-org/exllamav3`) install stock exllamav3, which can't load 4.5-7.5 bpw models; use the
+[install above](#install) for this fork.
 
 ---
 

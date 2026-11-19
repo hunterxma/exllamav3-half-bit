@@ -1,0 +1,43 @@
+name: Bug report
+description: Install, load, conversion or speed problem with the half-bit fork
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what you got. Paste the full error.
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU(s) and driver version
+      placeholder: "RTX 4090, driver 580.95"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS, CPU and RAM
+      placeholder: "Ubuntu 24.04, Ryzen 7 7700 (AVX-512), 64 GB"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Fork commit
+      description: Output of `git -C exllamav3 rev-parse --short HEAD`
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and bitrate
+      placeholder: "Qwen3.6-35B-A3B-EXL3-HalfRate-T5"
+  - type: textarea
+    id: install
+    attributes:
+      label: Installer or self-test output
+      description: For install problems, the full `install.sh` output (or `python -m exllamav3.util.selftest`).
+      render: text
