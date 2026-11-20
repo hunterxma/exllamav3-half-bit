@@ -74,11 +74,13 @@ class ModuleRunner:
     """Run rows through one module at a time. Clone states because modules may mutate inputs,
     including modules that run on CPU."""
 
-    def __init__(self, config, modules, device, streaming):
+    def __init__(self, config, modules, device, streaming, gpu_states=False):
         self.config = config
         self.modules = modules
         self.device = device
         self.streaming = streaming
+        # keep each module's output on the device (no host round trip per module); a caller that snapshots states moves them itself
+        self.gpu_states = gpu_states
 
     @contextmanager
     def loaded(self, idx):
@@ -115,7 +117,7 @@ class ModuleRunner:
             x = mod.prepare_for_device(state.clone(), params)
             x = mod.forward(x, params)
             if consume is None:
-                outputs.append(x.to("cpu", copy=True))
+                outputs.append(x if self.gpu_states else x.to("cpu", copy=True))
             else:
                 consume(r, x)
             del x, params

@@ -16,6 +16,9 @@ RECON_TEMP_BYTES = int(os.environ.get("EXL3_RECON_TEMP_MB", "64")) << 20
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+# Offline scoring (many rows through one loaded module): keep the original-basis fp16 weight for the life of the module instead of
+# rebuilding it for every row. Off by default (serving never wants the extra VRAM); ear_eval/swap_eval switch it on.
+cache_full_weight = os.environ.get("EXL3_CACHE_FULL_WEIGHT", "0") != "0"
 
 class LinearEXL3:
 
@@ -85,6 +88,7 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        self._w_full = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -101,7 +105,7 @@ class LinearEXL3:
 
     def unload(self):
         # g_tensor_cache.drop(*self.bsz1_xh_args)
-        pass
+        self._w_full = None
 
 
     def get_tensors(self, key: str):
@@ -187,6 +191,23 @@ class LinearEXL3:
                 self.in_features % 128 == 0 and self.out_features % 128 == 0
                 and not no_fused_reconstruct
             )
+
+        if cache_full_weight and self._fused_reconstruct and self.in_features * self.out_features * 2 <= (512 << 20):
+            # Original-basis weight built once, then plain gemms on the raw input (no had launches, no per-row reconstruct)
+            if self._w_full is None:
+                wf = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+                step = min(MAX_RECONSTRUCT_SLICE_N, self.out_features)
+                tmp = torch.empty((self.in_features, step), dtype = torch.half, device = self.trellis.device) if step < self.out_features else None
+                for n_start in range(0, self.out_features, step):
+                    n_end = min(n_start + step, self.out_features)
+                    w = wf if tmp is None else tmp[:, :n_end - n_start].contiguous() if n_end - n_start != step else tmp
+                    ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
+                    if tmp is not None: wf[:, n_start:n_end] = w
+                self._w_full = wf
+            ext.hgemm_recon(x, self._w_full, y_)
+            if self.bias is not None:
+                y += self.bias
+            return y
 
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
         # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
