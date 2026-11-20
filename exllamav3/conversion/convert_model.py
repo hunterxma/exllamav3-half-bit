@@ -1864,8 +1864,23 @@ def main(args, job_state):
             for m in module:
                 if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16 and \
                         not os.environ.get("EXL3_EXIT_AFTER_CAPTURE"):
-                    tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
-                    print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
+                    reusable = os.environ.get("EXL3_REUSE_EMBEDDING")
+                    if reusable:
+                        from safetensors.torch import load_file
+                        from .ngram import GROUP_DIM, words_per_row
+                        tensors = load_file(reusable)
+                        rows, dim = m.embedding.weight.shape
+                        groups = (dim + GROUP_DIM - 1) // GROUP_DIM
+                        trellis = tensors[f"{m.key}.trellis"]
+                        signs = tensors[f"{m.key}.signs"]
+                        if (trellis.shape != (rows, groups * words_per_row(args["embed_bits"], GROUP_DIM)) or
+                                trellis.dtype != torch.int16 or signs.shape != (groups, GROUP_DIM) or
+                                signs.dtype != torch.half):
+                            raise ValueError(f"{reusable}: incompatible embedding shape, rate or dtype")
+                        print(f" -- Reused: {m.key}  bpw: {args['embed_bits']}")
+                    else:
+                        tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
+                        print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
                     q_tensors.update(tensors)
                 else:
                     q_tensors.update(m.get_tensors())

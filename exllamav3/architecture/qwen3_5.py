@@ -19,6 +19,7 @@ from ..modules import (
     GDNState,
 )
 from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
+from ..modules.head_mixed_linear import apply_head_layout
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel
@@ -303,6 +304,11 @@ class Qwen3_5BaseModel(Model):
     ):
         super().__init__(config, **kwargs)
         self.use_moe = use_moe
+        layout_path = os.path.join(config.directory, "exl3_head_layout.json")
+        head_layout = {}
+        if not use_moe and os.path.isfile(layout_path):
+            with open(layout_path, encoding="utf-8") as file:
+                head_layout = json.load(file)
 
         self.modules += [
             Embedding(
@@ -439,6 +445,9 @@ class Qwen3_5BaseModel(Model):
                     ),
                 )
             ]
+
+            if head_layout:
+                apply_head_layout(self.modules[-1].attn, head_layout)
 
             if config.vision and config.vision.deepstack_visual_indexes:
                 if idx < len(config.vision.deepstack_visual_indexes):

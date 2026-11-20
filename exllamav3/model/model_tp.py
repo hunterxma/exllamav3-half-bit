@@ -48,7 +48,7 @@ def _check_command(fn, args):
         )
 
 cleanupper = Cleanupper()
-DISPATCH_TIMEOUT = 20
+DISPATCH_TIMEOUT = int(os.environ.get("EXL3_TP_DISPATCH_TIMEOUT", "20"))   # seconds a TP worker may take per command (module loads from disk need more)
 
 class Model_TPMixin:
 

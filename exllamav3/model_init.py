@@ -128,6 +128,8 @@ def add_args(
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
+        parser.add_argument("--draft_gpu_split", type = str, default = None,
+                            help = "Override the per-GPU GiB limits for a separately loaded draft model")
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
         parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
@@ -383,8 +385,9 @@ def init(
         printp(not quiet, f" -- Loading {draft_model_dir} with the target model")
     elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
+        draft_split = getattr(args, "draft_gpu_split", None)
         draft_model.load(
-            use_per_device = split,
+            use_per_device = [float(alloc) for alloc in draft_split.split(",")] if draft_split else split,
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
