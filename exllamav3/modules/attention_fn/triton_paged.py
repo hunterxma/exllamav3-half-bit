@@ -1148,9 +1148,6 @@ def _paged_attn_decode_combine_kernel(
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
 
 
-_DECODE_MAX_ROWS = int(os.environ.get("EXL3_ATTN_ROWS", "32"))   # 64 reads/dequantizes K/V once for a 7-row verify step on a 6-head group (42 rows) instead of twice
-
-
 def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, int]:
     """(BLOCK_ROWS, row blocks per kv head) for the decode split / combine kernels.
 
@@ -1161,7 +1158,7 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
     32 rows pays off at every head_dim up to 256 on Ampere, Blackwell and RDNA3 alike, the fp32
     accumulator notwithstanding, since the tile loads dominate; at least 16 rows, the dots' minimum."""
     rows = q_len * group_size
-    block_rows = max(16, min(_DECODE_MAX_ROWS, triton.next_power_of_2(rows)))
+    block_rows = max(16, min(32, triton.next_power_of_2(rows)))
     return block_rows, triton.cdiv(rows, block_rows)
 
 
