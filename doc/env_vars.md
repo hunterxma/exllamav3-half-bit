@@ -75,15 +75,6 @@ MLA counterpart of `EXL3_BC_ATTN`: decode steps (q_len ≤ 16) of an MLA layer r
 graph-captured C++ block (projections, absorb, latent attention, unfold, o_proj). Set to `0` to
 force the eager dispatch path, for A/B testing.
 
-### `EXL3_MOE_SHARED_COOP` (default: `1`)
-
-MoE layers with a shared expert run it, at decode batch sizes, as a one-expert launch of the fused
-expert kernels (at the shared expert's own bit width) instead of the three separate GEMV launches
-of its own graph; the routed launch merges the result as before. Applies to EXL3-quantized gated
-shared experts with 128-aligned widths and no post-norm. Under tensor parallelism such a shared
-expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
-rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
-
 ### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
 
 Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
@@ -591,19 +582,6 @@ cuBLAS. Shapes the kernel does not cover (K not a multiple of 64, N not a multip
 unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x uses swizzled
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
-
-### `EXL3_MOE_COOP_KSPLIT` (default: unset)
-
-Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over
-disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
-on every GPU here, so the default is no split. Testing knob only.
-
-### `EXL3_MOE_COOP_WIDE` (default: unset)
-
-Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
-the narrow tile (32 columns per block, k split 16 ways), `1` the wide one (128 columns per block,
-4 x 4 warps). Unset picks per stage: wide on Ampere/Ada at every shape, on Blackwell only for
-k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
 
 ### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
 

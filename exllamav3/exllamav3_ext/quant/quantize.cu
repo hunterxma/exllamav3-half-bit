@@ -202,8 +202,6 @@ static fp_quantize_tiles_kernel qt_frac_register(int KA, int threads)
 
 static int qt_frac_threads(int device, int KA)
 {
-    const char* env_nt = getenv("EXL3_FRAC_REG_NT");
-    if (env_nt) return atoi(env_nt);
     const auto* props = at::cuda::getDeviceProperties(device);
     if (KA == 5 && props->major == 8 && props->minor == 6) return 1024;
     return (KA >= 2 && KA <= 4) ? 1024 : 512;
@@ -217,9 +215,8 @@ static QtFracLaunch qt_frac_launch(int device, int KA, uint32_t mask)
     TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", mask, ")");
     int threads = 512;
     bool use_register = false;
-    const char* env = getenv("EXL3_FRAC_REG");
     const int requested = qt_frac_threads(device, KA);
-    if (!(env && env[0] == '0') && mask == 0xaaaau)
+    if (mask == 0xaaaau)
     {
         auto reg = qt_frac_register(KA, requested);
         if (reg)

@@ -70,7 +70,7 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
         return 32, 2, 2
     # head_dim 256 on CUDA: one stage. Two stages double the K/V tiles held per program and the split kernel ran
     # 1.5-1.8x slower on sm_86 and sm_120 (Qwen3.6-35B-A3B 8-bit cache, 1-7 query rows, 32k-96k context)
-    if hd_pad >= 256 and not ROCM and os.environ.get("EXL3_ATTN_HD256_1STAGE", "1") != "0":
+    if hd_pad >= 256 and not ROCM:
         return max(16, 8192 // hd_pad), ATTN_SPLIT_WARPS_STAGES[0], 1
     return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
 

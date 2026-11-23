@@ -295,10 +295,6 @@ void routing_gemv_rows_kernel
 
 static bool routing_gemv_rows_try(const at::Tensor& hidden, const at::Tensor& gate_t, at::Tensor& scores, cudaStream_t stream)
 {
-    // EXL3_ROUTING_GEMV_ROWS=0 keeps the int8 projection for every multi-row call
-    static int env = -2;
-    if (env == -2) { const char* e = std::getenv("EXL3_ROUTING_GEMV_ROWS"); env = e ? atoi(e) : 1; }
-    if (!env) return false;
     const int k = hidden.size(-1);
     const int E = scores.size(-1);
     const int rows = hidden.numel() / k;

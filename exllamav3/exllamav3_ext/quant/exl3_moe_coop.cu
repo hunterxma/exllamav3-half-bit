@@ -93,38 +93,16 @@ static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
 // routed launch (bsz x top-k slots) but not for a single-slot launch such as the shared expert
 // (one expert's tiles on a 100+ SM device): split k until there is a block per SM, keeping at
 // least 64 k-slices (1024 columns) per split so the partials and their reduction stay cheap.
-// EXL3_MOE_COOP_KSPLIT forces one factor for every stage (testing)
 static int moe_coop_pick_ksplit(int base, int kslices, int max_split, int device)
 {
-    static int forced = -2;
-    if (forced == -2)
-    {
-        const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT");
-        forced = env ? atoi(env) : 0;
-    }
-    if (forced > 0) return std::min(forced, max_split);
     const int want = CEIL_DIVIDE(DevCtx::instance().get_num_sms(device), std::max(base, 1));
     const int kcap = std::max(kslices / 64, 1);
     return std::max(1, std::min(std::min(want, kcap), max_split));
 }
 
-// Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
-// otherwise. EXL3_MOE_COOP_WIDE = 0 / 1 forces one geometry for every stage (testing)
-static int moe_coop_wide_mode()
-{
-    static int mode = -2;
-    if (mode == -2)
-    {
-        const char* env = std::getenv("EXL3_MOE_COOP_WIDE");
-        mode = env ? atoi(env) : -1;
-    }
-    return mode;
-}
-
+// Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one otherwise.
 static bool moe_coop_pick_wide(int kslices, int slots, int device)
 {
-    const int mode = moe_coop_wide_mode();
-    if (mode >= 0) return mode != 0;
     if (DevCtx::instance().get_cc(device) < CC_BLACKWELL) return true;
     return kslices >= 256 || (kslices >= 128 && slots >= 32);
 }
@@ -161,10 +139,8 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     // The down stage always takes the wide tile: its k (the intermediate width) is short, and narrow blocks there are
     // mostly fixed cost (T5 on an RTX 5060 Ti, k = 512: 3,584 narrow blocks of ~10 KB each; the down launch per pass
-    // 1,250 -> 840 us wide). EXL3_MOE_COOP_WIDE (both stages) or EXL3_MOE_COOP_WIDE_B (down only) = 0 / 1 force it
-    static int wide_b_env = -2;
-    if (wide_b_env == -2) { const char* e = std::getenv("EXL3_MOE_COOP_WIDE_B"); wide_b_env = e ? atoi(e) : -1; }
-    const bool wide_b = wide_b_env >= 0 ? wide_b_env != 0 : (moe_coop_wide_mode() >= 0 ? moe_coop_wide_mode() != 0 : true);
+    // 1,250 -> 840 us wide).
+    const bool wide_b = true;
     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
@@ -205,15 +181,13 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         // Each launch serves its own rate's runs (the rest exit at once); the per-slot gate/up counters belong to one
         // rate, and the down stage's per-token counters count every active slot, so the token's last arrival (in
         // either down launch) sums both rates' slots. A dual instance (exl3_moe_coop_inst_dual.cu) runs both gate/up
-        // rates in one launch instead; EXL3_MOE_COOP_DUAL=0 keeps the two launches
-        static int dual_env = -2;
-        if (dual_env == -2) { const char* e = std::getenv("EXL3_MOE_COOP_DUAL"); dual_env = e ? atoi(e) : 1; }
+        // rates in one launch instead
         MoeCoopParams p1 = p, p2 = p;
         p1.tier_only = 1; p2.tier_only = 2; p.tier_only = 0;
         void* args1[] = { (void*) &p1 };
         void* args2[] = { (void*) &p2 };
         const BitsK b1 = bits_from_K(K_gu), b2 = bits_from_K(K_gu2);
-        MoeCoopKernel kd = (dual_env && cb == 2) ? exl3_moe_coop_kernel_a_dual(b1.bits, b1.half, b2.bits, b2.half, p.Hi, wide_a)
+        MoeCoopKernel kd = (cb == 2) ? exl3_moe_coop_kernel_a_dual(b1.bits, b1.half, b2.bits, b2.half, p.Hi, wide_a)
                                                  : MoeCoopKernel { nullptr, 0 };
         if (kd.kernel)
         {

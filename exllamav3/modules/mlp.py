@@ -120,53 +120,6 @@ def capture_out_sensitivity(
         acc["count"] = acc["count"] + rows
 
 
-def capture_out_sensitivity_batched(
-    capture: dict,
-    gates: list,
-    ups: list,
-    downs: list,
-    g: torch.Tensor,
-    u: torch.Tensor,
-    activation_fn: str,
-    act_limit: float,
-    weights: torch.Tensor,
-    max_routed: int | None = None,
-):
-    """
-    capture_out_sensitivity for C experts at once: g, u (C, T, n), weights (C, T) routing weights (0 = not routed).
-    The slopes are elementwise, so one call over all C x T rows gives each expert's rows exactly; per expert the sum
-    of squares over its rows and the routed-row count go into its accumulators, as C separate calls would.
-
-    max_routed: an upper bound on the routed (expert, row) pairs, e.g. top-k x T. With it only those rows are
-    evaluated (an unrouted row has weight 0 and adds exactly nothing), about k / num_experts of the work, gathered
-    with a fixed-size nonzero (no host sync) and summed per expert in fp64
-    """
-    C, T, n = g.shape
-    rows = (weights != 0).sum(dim = 1)
-    if max_routed is not None and max_routed < C * T:
-        S = max_routed
-        flat = weights.reshape(-1)
-        idx = torch.nonzero_static(flat != 0, size = S, fill_value = C * T).flatten()
-        valid = idx < C * T
-        idx = idx.clamp(max = C * T - 1)
-        wv = (flat.index_select(0, idx).float() * valid).reshape(-1, 1)
-        slopes = gated_act_slopes(activation_fn, g.reshape(-1, n).index_select(0, idx), u.reshape(-1, n).index_select(0, idx), act_limit)
-        expert = torch.div(idx, T, rounding_mode = "floor")     # padding rows (weight 0) land on the last expert
-        def per_expert(c):
-            # fp64 sums per expert (index_add_ is 7x faster than an fp64 prefix sum here; its atomic order moves
-            # the fp64 sums by ~1e-13 relative, below the fp32 the scales are used in)
-            return torch.zeros((C, n), dtype = torch.double, device = c.device).index_add_(0, expert, c.double().square())
-    else:
-        slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
-        wv = weights.float().reshape(-1, 1)
-        per_expert = lambda c: c.double().square().view(C, T, n).sum(dim = 1)   # noqa: E731
-    if slopes is None:
-        return
-    for lins, c in zip((ups, gates), slopes):
-        c = torch.nan_to_num(c * wv, nan = 0.0, posinf = 0.0, neginf = 0.0)
-        _accumulate_sens(capture, lins, downs, per_expert(c), rows)
-
-
 def _accumulate_sens(capture: dict, lins: list, downs: list, sq: torch.Tensor, rows: torch.Tensor):
     """Add per-expert sums of squared slopes sq (E, n) and routed-row counts rows (E,) to the accumulators of lins"""
     n = sq.shape[1]
@@ -202,7 +155,7 @@ def capture_out_sensitivity_routed(
     capture_out_sensitivity for E experts from their routed rows only, gathered beforehand: g, u (S, n) the gate and
     up outputs of S (expert, row) pairs, expert (S,) each pair's index into the lists, wv (S,) its routing weight
     (0 on padding pairs), rows (E,) the routed-row count per expert. The slopes are evaluated once for all experts;
-    each expert's sum covers exactly its routed rows, as capture_out_sensitivity_batched computes it
+    each expert's sum covers exactly its routed rows
     """
     E, n = len(gates), g.shape[1]
     slopes = gated_act_slopes(activation_fn, g, u, act_limit)

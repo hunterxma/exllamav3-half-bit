@@ -1276,13 +1276,12 @@ def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
 # Scale search cost, validated on Qwen3.6-35B layer 0 (774 tensors, 2.5-8 bpw, against the old 3 / 1 / 5):
 # coarse stride 9 + 3 adaptive fine points = half the sample quantizations, 697/715 tensors bit-identical, geo-mean
 # proxy error ratio 0.997, layer rfn 0.004687 vs 0.004746. A fine stride of 2 cost +0.5% proxy error: kept at 1.
-# EXL3_GSS_COARSE_STRIDE=3 EXL3_GSS_FINE_POINTS=5 restores the old search
-_GSS_COARSE_STRIDE = int(os.environ.get("EXL3_GSS_COARSE_STRIDE", 9))
-_GSS_FINE_STRIDE = int(os.environ.get("EXL3_GSS_FINE_STRIDE", 1))
-# EXL3_GSS_FINE_POINTS=3: the fine stage evaluates the coarse minimum and its two neighbours (+-0.075); a tensor whose
-# minimum lands on an edge gets the next point outward (one extra batched evaluation for those only), so the
-# parabola always brackets a minimum like the 5-point grid's interior case
-_GSS_FINE_POINTS = int(os.environ.get("EXL3_GSS_FINE_POINTS", 3))
+_GSS_COARSE_STRIDE = 9
+_GSS_FINE_STRIDE = 1
+# the fine stage evaluates the coarse minimum and its two neighbours (+-0.075); a tensor whose minimum lands on an
+# edge gets the next point outward (one extra batched evaluation for those only), so the parabola always brackets
+# a minimum like the 5-point grid's interior case
+_GSS_FINE_POINTS = 3
 
 
 def g_scale_search_batch(
@@ -1323,7 +1322,7 @@ def g_scale_search_batch(
         return out
 
     # Stage 1: coarse grid over the full search range, on a subsample of each tensor's tiles
-    # (EXL3_GSS_COARSE_STRIDE / EXL3_GSS_FINE_STRIDE: tile subsampling of the two stages, default 3 / 1)
+    # (tile subsampling of the two stages: coarse stride 9, fine stride 1)
     coarse = [0.1 + 0.2 * i for i in range(10)]  # 0.1 .. 1.9, same range as the old golden-section bracket
     subs = [s[::_GSS_COARSE_STRIDE] for s in samples]
     pairs1 = [(t, s) for t in range(n_t) for s in coarse]

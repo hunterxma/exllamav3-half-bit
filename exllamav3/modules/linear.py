@@ -33,9 +33,6 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
-_LORA_FAST = os.environ.get("EXL3_LORA_FAST", "1") != "0"
-
-
 class Linear(Module):
 
     def __init__(
@@ -794,10 +791,9 @@ class Linear(Module):
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
         orig_shape = lora_input.shape
         flat = lora_input.view(-1, orig_shape[-1])
-        # Fast path (default): x += (input @ A) @ B as ONE in-place addmm, no [tokens, out] temporary and no separate elementwise add.
-        # EXL3_LORA_FAST=0 restores the original two-matmul + add path (used for the interleaved A/B speed test).
-        fast = _LORA_FAST and x.is_contiguous()
-        out = x.view(-1, x.shape[-1]) if fast else None
+        # x += (input @ A) @ B as one in-place addmm: no [tokens, out] temporary and no separate elementwise add.
+        # A non-contiguous output or a dtype mismatch takes the plain add below.
+        out = x.view(-1, x.shape[-1]) if x.is_contiguous() else None
         for lora, a in self.lora_a_tensors.items():
             b = self.lora_b_tensors.get(lora)
             if b is None:

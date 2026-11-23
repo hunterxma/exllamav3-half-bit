@@ -100,13 +100,11 @@ void BC_BlockSparseMLP::run_bszN
         // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
         // the sigmoid gate, if any, is applied by the routed launch when it merges the result.
         // Its blocks fill a few SMs only, so it runs on a side stream alongside the routed rotation and gate/up
-        // stage; the routed down stage waits for it. EXL3_MOE_SH_OVERLAP=0 runs it first on the same stream.
-        // Expert-range shards keep the old order (their empty token rows read the shared output in the A stage)
-        static int ovl_env = -2;
-        if (ovl_env == -2) { const char* e = std::getenv("EXL3_MOE_SH_OVERLAP"); ovl_env = e ? atoi(e) : 1; }
+        // stage; the routed down stage waits for it.
+        // Expert-range shards run it first on the same stream (their empty token rows read the shared output in the A stage)
         const MoeCoopParams& rp = tier ? tier_p : coop_p;
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        if (ovl_env && rp.min_expert < 0)
+        if (rp.min_expert < 0)
         {
             const int dev = y.device().index();
             cudaStream_t main = at::cuda::getCurrentCUDAStream(dev).stream();
