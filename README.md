@@ -97,18 +97,20 @@ Both half-bit builds are on Hugging Face: [EXL3 Half-Rate T5](https://huggingfac
 | Area | Change | Checked against |
 |---|---|---|
 | Format, GEMM | 4.5-7.5 bpw in packing, reconstruct, GEMM and MoE kernels | 601 kernel tests |
-| Decode MoE kernel | 2 blocks per SM up to 6 bpw | identical output to the previous kernel |
-| Quantizer | register-resident half-rate trellis search | bit-identical to the reference kernel |
-| Converter | routed-token sensitivity, no host syncs, faster g-scale search; `EXL3_CONVERT_REUSE=<build>` copies unchanged tensors from an earlier build | fp32-identical statistics |
-| CPU experts | half rates on AVX2, AVX-512 and the scalar path; packed planar layout + prefetch on AVX2 | within 1.3% of the GPU result; bit-exact A/B |
-| CPU placement | `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer; a layer stored at two rates puts the smaller group on the CPU | identical output |
-| MTP drafting | `-dpm` confidence threshold, sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`) | same tokens / same output distribution |
-| GPU rate tier | a layer stored at two rates runs on the GPU in one fused decode launch sequence: one run table and rotation, a gate/up launch per rate, one per-token reduction (default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it, `0` disables it) | KLD 0.0007 vs the CPU-split path; 10x closer to an fp32 reference than the dense path |
-| Decode MoE kernel | one completion arrival per block for all its rows (was one fence and up to three barriers per row); the down stage always on the wide tile | identical output, 267 MoE kernel tests on sm_86 and sm_120 |
-| Decode MoE path | a two-rate layer's gate/up in one launch; the shared expert on a side stream joined before the down stage; router for 2-8 rows uses the single-row FMA GEMV per row (a token routes the same in an MTP verify round as alone) | bit-identical output (router: identical to single-row routing); same kernel test counts on sm_86 and sm_120 |
-| Decode attention | split kernel at one pipeline stage for head_dim 256 on CUDA (`EXL3_ATTN_HD256_1STAGE=0` restores two): 1.5-1.8x faster kernel at 32k-96k context | same math; outputs differ only at fp16 rounding (~1e-4), as with any split-count change |
+| Decode MoE kernel | two blocks per SM up to 6 bpw; one completion arrival per block for all its rows; the down stage always on the wide tile | identical output; 267 MoE kernel tests on sm_86 and sm_120 |
+| Decode MoE path | a two-rate layer's gate/up in one launch; the shared expert on a side stream, joined before the down stage; the router for 2-8 rows runs a single-row GEMV per row, so a token routes the same inside an MTP verify round as alone | bit-identical output |
+| GPU rate tier | a layer stored at two rates runs on the GPU in one fused decode launch sequence (the default when the layer takes no CPU split; `EXL3_MOE_TIER_GPU=1` forces it) | identical output |
+| Decode attention | the split kernel runs one pipeline stage for head_dim 256 on CUDA: 1.5-1.8x faster at 32k-96k context | same math; outputs differ only at fp16 rounding (~1e-4) |
+| CPU experts | half rates on AVX2, AVX-512 and the scalar path; packed planar layout with prefetch on AVX2; `EXL3_MOE_CPU_SPLIT_MAP` sets the split per layer | within 1.3% of the GPU result; bit-exact A/B |
+| MTP drafting | confidence threshold (`-dpm`), sparse draft head (`-sdh`), `EXL3_MOE_CPU_SPLIT_DRAFT`, optional speculative sampling (`-ssp`; slower at these sizes because it needs the full-vocabulary head) | same tokens; same output distribution |
+| Quantizer | register-resident half-rate trellis search; its scratch is one resident wave (2.5 bpw: 1,032 MiB down to 112 / 144 MiB on a 3060 / 5060 Ti); the 5.5 bpw launch uses 1,024 threads on sm_86 and 512 on sm_120 (+9.2% / +17.5% tiles/s); large tensors split their tiles across all GPUs | bit-identical to the reference kernel |
+| Converter | routed-token sensitivity, no host syncs, faster scale search; the scale refit keeps H@W when memory allows (per projection: 834 to 502 ms on a 3060, 365 to 251 ms on a 5060 Ti); `EXL3_CONVERT_REUSE=<build>` copies unchanged tensors and reads each donor's stored rate from its header first | fp32-identical statistics; exact fitted weights and scales |
+| Inference dispatch | Qwen3.8's 5120x17408 4-bit gate takes the packed path up to 256 rows on sm_120 (0.995 against 1.138 ms at 160 rows); the RTX 3060 keeps reconstruction, which is faster there | measured on the layer |
+| Offline scoring | optional full-weight cache and GPU-resident states (`EXL3_CACHE_FULL_WEIGHT`): 1.7-2.8x faster swap and error sweeps | scores match |
+| Head-wise rates | a per-head rate split in the loader and converter | tests |
+| LoRA | the adapter applies as one in-place addmm; decode is unchanged at rank 32-128 and prefill is about 3% slower | matches float64 |
 | Build | `setup.py` builds the extension for every GPU in the system (`TORCH_CUDA_ARCH_LIST` overrides) | |
-| Misc | loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture (avoids OOM on a full 16 GB card) | |
+| Misc | the loader respects `model.safetensors.index.json`; idle cached memory is freed before CUDA-graph capture, which avoids an OOM on a full 16 GB card | |
 
 Run the tests (a rerun of the installer skips the build):
 
@@ -145,7 +147,8 @@ within noise; the gains are at 5-6 bpw.
 so if experts end up on the CPU anyway, store them at 5.
 
 **Conversion:** the half-rate trellis search runs 1.35-2.1x faster than the reference kernel, and a full
-Qwen3.6-35B-A3B layer converts in about 200 s instead of 414 s.
+Qwen3.6-35B-A3B layer converts in about 200 s instead of 414 s. The quantizer scratch is 8-9x smaller, and with two
+GPUs a large tensor's tiles are split across both (64 tiles ran 2.65x faster with the slower card first).
 
 **End to end**, same model and settings, only the kernels changed (24.6 GB integer-rate Qwen3.6-35B-A3B, 104 of
 256 experts per layer on the CPU, MTP with 4 drafts, 32k context, 8-bit cache):
@@ -183,8 +186,25 @@ At 96k context it decodes 150-180 tok/s and reads a 92k-token prompt at 1,514 to
 Decode on these cards is limited by the trellis arithmetic, not memory bandwidth: a 31% lower core clock made the
 MoE kernels 40-51% slower.
 
-`MODEL=/path/to/model bash install.sh` picks this setting on its own. A fresh clone on this machine decodes 187-192
-tok/s.
+Later tuning at 96k context on the 23.9 GB T5 FV build (three prompts, 768 tokens each, baseline repeated seven times
+at 201.1-203.0 tok/s, mean 202.1):
+
+| Setting | Decode | Draft accepted |
+|---|---|---|
+| 6 drafts, 16k-column sparse head (the setting above) | 201.1-203.0 tok/s | 81% |
+| 7 drafts | 209.9 tok/s (+3.9%) | 83% |
+| 7 drafts, 8k head | 210.9 tok/s | 81% |
+| **7 drafts, 4k head (the installer's default)** | **212.8 tok/s (+5.3%)** | 83% |
+| 7 drafts, 2k head | 213.9 tok/s | 82% |
+| 7 drafts, 1k head | 173.0 tok/s | 81% |
+| 8 drafts, 8k head | 181.7 tok/s | 83% |
+| 7 drafts, confidence threshold 0.8 / 0.9 | 210.3 / 201.5 tok/s | 78% / 85% |
+| speculative sampling (`-ssp`) | 167.1 tok/s | 85% |
+
+The 2k head is within noise of the 4k head but sits next to a cliff (1k loses 19%), and the test prompts are plain
+English; code and other languages draft tokens outside a small head. The installer therefore uses 4k.
+
+`MODEL=/path/to/model bash install.sh` picks this setting on its own.
 
 ## Limitations
 

@@ -27,14 +27,15 @@ ap.add_argument("--ndt", type = int, default = 4, help = argparse.SUPPRESS)
 args = ap.parse_args()
 
 # chat.py arguments, also written to run.sh: 8-bit KV cache; MTP drafts, each drafted only at >= 85% drafter
-# probability, through a 16k-column sparse draft head; 2048-token prefill chunks (+46-54% prompt speed at 8k-30k for
-# +84 MiB). Drafts per step: 4 with experts on the CPU (one 16 GB card: 109.8 tok/s at 32k, 88% accepted), 6 with every
-# expert on the GPUs, where verifying a longer draft costs less (two GPUs: 170 vs 160 tok/s at 32k, 166 vs 159 at 96k)
+# probability, through a 4k-column sparse draft head; 2048-token prefill chunks (+46-54% prompt speed at 8k-30k for
+# +84 MiB). Drafts per step: 4 with experts on the CPU (one 16 GB card: 109.8 tok/s at 32k, 88% accepted), 7 with every
+# expert on the GPUs, where verifying a longer draft costs less (two GPUs, 96k context: 7 drafts and a 4k head decode
+# 212.8 tok/s against 202.1 with 6 drafts and a 16k head; 8 drafts is slower, 181.7; a 1k head falls to 173)
 def run_args(ndt, gs = None):
-    return (["-cs", str(args.ctx), "-cq", "8", "-mtp", "-ndt", str(ndt), "-dpm", "0.85", "-sdh", "16384",
+    return (["-cs", str(args.ctx), "-cq", "8", "-mtp", "-ndt", str(ndt), "-dpm", "0.85", "-sdh", "4096",
              "-chunk_size", "2048", "-gcs", "2048"] + (["-gs", gs] if gs else []))
 RUN_ARGS = run_args(args.ndt, args.gs)
-DRAFTS_GPU, DRAFTS_CPU = 6, 4
+DRAFTS_GPU, DRAFTS_CPU = 7, 4
 
 if args.attempt:   # one load + generation in this process; prints a JSON line
     import time, torch

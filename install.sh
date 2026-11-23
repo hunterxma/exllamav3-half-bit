@@ -331,7 +331,7 @@ RUN
 export EXL3_MOE_CPU_SPLIT=$S
 $ENV
 exec "$VENV/bin/python" "$REPO/examples/server.py" -m "$MODEL" --port 8000 -c $CTX -cq 8 --chunk 2048 --draft $D \\
-  --draft-p-min 0.85 --sparse-head 16384 --gs $G "\$@"
+  --draft-p-min 0.85 --sparse-head 4096 --gs $G "\$@"
 SERVE
   chmod +x "$REPO/run.sh" "$REPO/serve.sh"
   say "fitted: $S experts per layer on the CPU, MTP $D drafts, VRAM budget $G (fit.json). ./run.sh to chat, ./serve.sh for an API on port 8000"
