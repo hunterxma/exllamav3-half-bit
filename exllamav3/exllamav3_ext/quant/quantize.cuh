@@ -4,6 +4,7 @@
 #include <tuple>
 
 std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bool mul1, int L);
+std::tuple<bool, int64_t> quantize_tiles_frac_scratch(int device, int KA, int64_t MASK);
 
 void quantize_tiles
 (

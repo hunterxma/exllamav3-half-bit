@@ -171,6 +171,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
+    m.def("quantize_tiles_frac_scratch", &quantize_tiles_frac_scratch, "quantize_tiles_frac_scratch");
     m.def("quantize_tiles_frac", &quantize_tiles_frac, "quantize_tiles_frac");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");

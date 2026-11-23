@@ -125,11 +125,39 @@ def trellis_words(K) -> int:
 
 
 @lru_cache
-def get_temp_buffers_frac(device, ka: int):
+def _get_temp_buffers_frac(device_index: int, ka: int):
     edges = 65536 >> ka
-    temp_costs = torch.zeros((128, 2, edges), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((128, 256, edges), dtype = torch.short, device = device)
+    device = torch.device("cuda", device_index)
+    register_kernel, wave = ext.quantize_tiles_frac_scratch(device_index, ka, 0xAAAA)
+    if register_kernel:
+        # The register kernel stores byte history and keeps the cost rows in shared memory.
+        # It only needs a nonempty costs pointer for the shared kernel signature.
+        batch = max(1, int(wave))
+        temp_costs = torch.empty((1,), dtype = torch.half, device = device)
+        temp_edges = torch.empty((batch, 256, edges), dtype = torch.uint8, device = device)
+    else:
+        # The generic fallback uses global half costs and 16-bit history for up to 128 tiles.
+        batch = 128
+        temp_costs = torch.zeros((batch, 2, edges), dtype = torch.half, device = device)
+        temp_edges = torch.zeros((batch, 256, edges), dtype = torch.short, device = device)
     return temp_costs, temp_edges
+
+
+def get_temp_buffers_frac(device, ka: int):
+    # Canonical integer cache keys keep cuda:0, torch.device("cuda:0"), and 0 from retaining
+    # separate large workspaces for the same physical device.
+    if isinstance(device, int):
+        device_index = device
+    else:
+        d = torch.device(device)
+        if d.type != "cuda":
+            raise ValueError(f"fractional quantizer scratch requires a CUDA device, got {d}")
+        device_index = torch.cuda.current_device() if d.index is None else d.index
+    return _get_temp_buffers_frac(device_index, int(ka))
+
+
+get_temp_buffers_frac.cache_clear = _get_temp_buffers_frac.cache_clear
+get_temp_buffers_frac.cache_info = _get_temp_buffers_frac.cache_info
 
 
 def quantize_tiles_frac(tiles, quant_args: dict):
@@ -262,9 +290,22 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     each GPU quantizes its slice on a per-device stream. Results are copied back through pinned memory and gathered
     on the first device.
     """
-    if frac_k(quant_args["K"]) is not None:
-        return quantize_tiles_frac(tiles, quant_args)
     devices = quant_args["devices"]
+    fractional = frac_k(quant_args["K"])
+    if fractional is not None:
+        assert quant_codebook(quant_args)[1], "fractional bitrates require the mul1 codebook"
+
+        # The measured crossover depends on which GPU owns the input. If that GPU is already
+        # fastest, keep small batches local; if another participating GPU is faster, offload even
+        # small batches because the gain exceeds the pinned-copy cost on this two-card rig.
+        override = os.environ.get("EXL3_FRAC_MGPU_MIN_TILES")
+        if override is None:
+            ratios = quant_args.get("device_ratios") or auto_split.ratios("quant_tiles", devices)
+            min_tiles = 256 if ratios[0] >= max(ratios) else 1
+        else:
+            min_tiles = max(1, int(override))
+        if tiles.shape[0] < min_tiles:
+            return quantize_tiles_frac(tiles, quant_args)
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
 
@@ -272,9 +313,13 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     pin_tiles, pin_q_tiles, pin_q_idx = get_pinned(tiles.shape[0])
 
     # Copy input tiles to pinned memory. Input is always on the first device in the split
-    copy_input_event = torch.cuda.Event(blocking = False)
     main_stream = get_quant_stream(devices[0])
+    caller_stream = torch.cuda.current_stream(tiles.device)
+    input_ready_event = torch.cuda.Event(blocking = False)
+    input_ready_event.record(caller_stream)
+    copy_input_event = torch.cuda.Event(blocking = False)
     with torch.cuda.stream(main_stream):
+        main_stream.wait_event(input_ready_event)
         tiles = tiles.contiguous()
         pin_tiles.copy_(tiles, non_blocking = True)
         copy_input_event.record(main_stream)
@@ -348,21 +393,27 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 dev_q_tiles = torch.empty_like(dev_tiles, device = device)
                 dev_q_idx = torch.empty_like(dev_tiles, dtype = torch.short, device = device)
 
-                # Work buffers
+                # Work buffers and kernel depend on the rate family.
                 K = quant_args["K"]
-                mcg, mul1 = quant_codebook(quant_args)
-                temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
-
-                ext.quantize_tiles(
-                    dev_tiles,
-                    dev_q_tiles,
-                    dev_q_idx,
-                    temp_costs,
-                    temp_edges,
-                    K,
-                    mcg,
-                    mul1
-                )
+                if fractional is not None:
+                    ka, mask = fractional
+                    temp_costs, temp_edges = get_temp_buffers_frac(device, ka)
+                    ext.quantize_tiles_frac(
+                        dev_tiles, dev_q_tiles, dev_q_idx, temp_costs, temp_edges, ka, mask
+                    )
+                else:
+                    mcg, mul1 = quant_codebook(quant_args)
+                    temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
+                    ext.quantize_tiles(
+                        dev_tiles,
+                        dev_q_tiles,
+                        dev_q_idx,
+                        temp_costs,
+                        temp_edges,
+                        K,
+                        mcg,
+                        mul1
+                    )
 
                 # Async copy back to pinned memory
                 pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
@@ -384,6 +435,11 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         q_idx = torch.empty_like(tiles, dtype = torch.short, device = devices[0])
         q_tiles.copy_(pin_q_tiles, non_blocking = True)
         q_idx.copy_(pin_q_idx, non_blocking = True)
+        output_ready_event = torch.cuda.Event(blocking = False)
+        output_ready_event.record(main_stream)
+
+    # Make the returned tensors ready for immediate use by the stream that called us.
+    caller_stream.wait_event(output_ready_event)
 
     return q_tiles, q_idx
 
@@ -1653,6 +1709,18 @@ def damping_share(quant_args: dict) -> float:
     return r / (1.0 + r)
 
 
+def _refit_hw_cache_allowed(device: torch.device, k: int, n: int) -> bool:
+    """Bound retained H@W workspace and leave VRAM headroom for the remaining conversion phases."""
+    if device.type != "cuda":
+        return False
+    workspace_bytes = k * n * torch.tensor([], dtype = torch.float32).element_size()
+    if workspace_bytes > 256 * 1024**2:
+        return False
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    reserve_bytes = max(512 * 1024**2, total_bytes // 10)
+    return free_bytes >= workspace_bytes + reserve_bytes
+
+
 def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
                  rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
     """
@@ -1679,13 +1747,36 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     Q = weight_q
     su = su.float().to(dev).view(k, 1).clone()
     sv = sv.float().to(dev).view(1, n).clone()
-    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
+    # Cache H@W only when the full FP32 product is small and current free VRAM leaves a reserve.
+    # Large weights (notably lm_head) keep the streamed path and never hold this extra matrix.
+    hw_chunks = [] if _refit_hw_cache_allowed(dev, k, n) else None
     den = 0.0
-    for a in range(0, n, chunk):
-        b = min(a + chunk, n)
-        wc = cols(weight, a, b)
-        HW_chunk = H @ wc
-        den += (wc * HW_chunk).sum().item()
+    try:
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            HW_chunk = H @ wc
+            if hw_chunks is not None:
+                hw_chunks.append(HW_chunk)
+            den += (wc * HW_chunk).sum().item()
+    except torch.OutOfMemoryError:
+        # If conversion memory changed after the free-space check, release the partial cache and
+        # recompute the denominator with the established streamed implementation.
+        hw_chunks = None
+        HW_chunk = None
+        wc = None
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        den = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            den += (wc * (H @ wc)).sum().item()
+    else:
+        if hw_chunks is not None:
+            # Don't keep the last input chunk alongside the retained products.
+            HW_chunk = None
+            wc = None
     den_err = den
     if H_err is not H:
         den_err = 0.0
@@ -1706,10 +1797,13 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         num = torch.zeros(n, device=dev)
         dn = torch.zeros(n, device=dev)
         
-        for a in range(0, n, chunk):
+        for chunk_i, a in enumerate(range(0, n, chunk)):
             b = min(a + chunk, n)
-            wc = cols(weight, a, b)
-            HW_chunk = H @ wc # Recompute on the fly
+            if hw_chunks is None:
+                wc = cols(weight, a, b)
+                HW_chunk = H @ wc
+            else:
+                HW_chunk = hw_chunks[chunk_i]
             
             HQ = H @ Q[:, a:b]
             num[a:b] = (Q[:, a:b] * HW_chunk).sum(0)
@@ -1724,10 +1818,13 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         A.diagonal().add_(1e-6 * A.diagonal().mean())
 
         b_ = torch.zeros(k, device=dev)
-        for a in range(0, n, chunk):
+        for chunk_i, a in enumerate(range(0, n, chunk)):
             b = min(a + chunk, n)
-            wc = cols(weight, a, b)
-            HW_chunk = H @ wc
+            if hw_chunks is None:
+                wc = cols(weight, a, b)
+                HW_chunk = H @ wc
+            else:
+                HW_chunk = hw_chunks[chunk_i]
             b_ += (Q[:, a:b] * HW_chunk).sum(1)
         
         r = torch.linalg.solve(A, b_)

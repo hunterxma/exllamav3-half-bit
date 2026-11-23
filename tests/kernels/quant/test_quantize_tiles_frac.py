@@ -7,7 +7,7 @@ MASK 0xAAAA, mul1 codebook only), mirroring tests/kernels/quant/test_quantize_ti
 - the MSE for unit Gaussian tiles stays within per-rate bounds and below the integer rate KA's MSE on the same tiles
   (the extra half bit has to buy distortion)
 - a tile that is itself a decoded valid codeword is recovered exactly
-- results do not depend on batch composition or on the 128-tile batching of the scratch (batches crossing it)
+- results do not depend on batch composition or on scratch-wave batching (batches crossing it)
 - rejections: rates without an instance, tile length != 256, wrong dtypes; an empty batch is a no-op
 
 References: testlib.trellis (NumPy codebook decode, ring step widths, bitstream unpack); quantize_tiles (integer K)
@@ -39,6 +39,33 @@ def _check_encoding(y, idx, K):
     assert tref.is_tail_biting(idx_np, K), "not a tail-biting path at the alternating step widths"
     dec = tref.decode(idx_np, "mul1").astype(np.float32)
     assert np.array_equal(y.cpu().numpy(), dec), "returned tile is not the decode of the returned encoding"
+
+
+@pytest.mark.parametrize("ka", [2, 5])
+@torch.inference_mode()
+def test_scratch_capacity_matches_selected_kernel(device, ka):
+    dev = torch.device(device)
+    optimized, wave = ext.quantize_tiles_frac_scratch(dev.index, ka, 0xAAAA)
+    get_temp_buffers_frac.cache_clear()
+    costs, edges = get_temp_buffers_frac(device, ka)
+    if optimized:
+        assert costs.numel() == 1
+        assert edges.shape[0] == wave
+        assert edges.dtype == torch.uint8
+    else:
+        assert costs.shape[0] == 128
+        assert edges.shape[0] == 128
+
+
+@torch.inference_mode()
+def test_fractional_scratch_cache_normalizes_device_aliases(device):
+    get_temp_buffers_frac.cache_clear()
+    dev = torch.device(device)
+    by_string = get_temp_buffers_frac(device, 2)
+    by_device = get_temp_buffers_frac(dev, 2)
+    by_index = get_temp_buffers_frac(dev.index, 2)
+    assert by_string[0].data_ptr() == by_device[0].data_ptr() == by_index[0].data_ptr()
+    assert by_string[1].data_ptr() == by_device[1].data_ptr() == by_index[1].data_ptr()
 
 
 @pytest.mark.parametrize("batch", [1, 17, 128, 131])

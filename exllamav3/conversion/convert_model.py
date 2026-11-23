@@ -6,7 +6,7 @@ from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
-from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, get_temp_buffers_frac
 from ..modules.quant.exl3_lib import quantize as exl3_quantize
 from ..util.memory import is_integrated_device
 from ..modules.quant.exl3_lib.hessian_packed import packed_numel
@@ -905,10 +905,13 @@ def reuse_linears(linears, strategy):
         if k + ".trellis" not in wm or k + ".mul1" not in wm or _reuse_requant(k):
             keep.append(l)
             continue
-        trellis = get(k + ".trellis", l.device)
-        if trellis.shape[-1] / 16 != float(strategy[k]):
+        stored_rate = _reuse_rate(k)
+        if stored_rate is None or abs(stored_rate - float(strategy[k])) > 1e-9:
             keep.append(l)
             continue
+        # Check the safetensors header before loading the trellis onto the target GPU. A donor at
+        # another rate cannot be reused, and transferring it just to reject it wastes PCIe bandwidth.
+        trellis = get(k + ".trellis", l.device)
         bias = l.inner.get_bias_tensor()
         l.inner = LinearEXL3(
             l.config, l.in_features, l.out_features, None, None, None,
@@ -1637,6 +1640,7 @@ def main(args, job_state):
     for idx, module in enumerate(model.modules):
 
         get_temp_buffers.cache_clear()
+        get_temp_buffers_frac.cache_clear()
         free_mem()
 
         start_module_time = time.time()
@@ -1905,6 +1909,7 @@ def main(args, job_state):
         # Reload module from memory. The quantizer's per-device workspaces are done with: release them so the
         # state-advance replicas find the room (they are rebuilt when the next module quantizes)
         get_temp_buffers.cache_clear()
+        get_temp_buffers_frac.cache_clear()
         free_mem()
         config.stc.set_new_tensors(q_tensors)
         module.load(
@@ -2027,6 +2032,7 @@ def main(args, job_state):
         for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
             get_temp_buffers.cache_clear()   # see main loop
+            get_temp_buffers_frac.cache_clear()
             free_mem()
             start_module_time = time.time()
 

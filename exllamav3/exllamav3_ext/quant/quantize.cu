@@ -161,6 +161,90 @@ std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bo
     return {launch.optimized, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
 }
 
+struct QtFracLaunch
+{
+    fp_quantize_tiles_kernel kernel;
+    int threads;
+    int shmem;
+    int blocks_per_sm;
+    bool register_kernel;
+};
+
+static fp_quantize_tiles_kernel qt_frac_generic(int KA, uint32_t mask)
+{
+    struct { int ka; uint32_t mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
+        {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
+        {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
+        {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
+        {4, 0xaaaau, &quantize_tiles_frac_kernel_a4_maaaa},
+        {5, 0xaaaau, &quantize_tiles_frac_kernel_a5_maaaa},
+        {6, 0xaaaau, &quantize_tiles_frac_kernel_a6_maaaa},
+        {7, 0xaaaau, &quantize_tiles_frac_kernel_a7_maaaa},
+    };
+    for (const auto& e : table) if (e.ka == KA && e.mask == mask) return e.fn();
+    return nullptr;
+}
+
+static fp_quantize_tiles_kernel qt_frac_register(int KA, int threads)
+{
+    typedef fp_quantize_tiles_kernel (*fn_t)();
+    const fn_t t512[8] = {nullptr,
+        nullptr, &quantize_tiles_frac_reg_kernel_a2_maaaa_t512, &quantize_tiles_frac_reg_kernel_a3_maaaa_t512,
+        &quantize_tiles_frac_reg_kernel_a4_maaaa_t512, &quantize_tiles_frac_reg_kernel_a5_maaaa_t512,
+        &quantize_tiles_frac_reg_kernel_a6_maaaa_t512, &quantize_tiles_frac_reg_kernel_a7_maaaa_t512};
+    const fn_t t1024[8] = {nullptr,
+        nullptr, &quantize_tiles_frac_reg_kernel_a2_maaaa_t1024, &quantize_tiles_frac_reg_kernel_a3_maaaa_t1024,
+        &quantize_tiles_frac_reg_kernel_a4_maaaa_t1024, &quantize_tiles_frac_reg_kernel_a5_maaaa_t1024,
+        &quantize_tiles_frac_reg_kernel_a6_maaaa_t1024, &quantize_tiles_frac_reg_kernel_a7_maaaa_t1024};
+    if (KA < 2 || KA > 7 || (threads != 512 && threads != 1024)) return nullptr;
+    return threads == 1024 ? t1024[KA]() : t512[KA]();
+}
+
+static int qt_frac_threads(int device, int KA)
+{
+    const char* env_nt = getenv("EXL3_FRAC_REG_NT");
+    if (env_nt) return atoi(env_nt);
+    const auto* props = at::cuda::getDeviceProperties(device);
+    if (KA == 5 && props->major == 8 && props->minor == 6) return 1024;
+    return (KA >= 2 && KA <= 4) ? 1024 : 512;
+}
+
+static QtFracLaunch qt_frac_launch(int device, int KA, uint32_t mask)
+{
+    const int edges = 65536 >> KA;
+    const int L = 256;
+    fp_quantize_tiles_kernel kernel = qt_frac_generic(KA, mask);
+    TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", mask, ")");
+    int threads = 512;
+    bool use_register = false;
+    const char* env = getenv("EXL3_FRAC_REG");
+    const int requested = qt_frac_threads(device, KA);
+    if (!(env && env[0] == '0') && mask == 0xaaaau)
+    {
+        auto reg = qt_frac_register(KA, requested);
+        if (reg)
+        {
+            kernel = reg;
+            threads = requested;
+            use_register = true;
+        }
+    }
+    const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128
+        + (QTF_SMEM_COSTS(KA) ? 2 * edges * (int) sizeof(half) : 0);
+    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    int blocks_per_sm = 0;
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, threads, shmem));
+    return {kernel, threads, shmem, blocks_per_sm, use_register};
+}
+
+std::tuple<bool, int64_t> quantize_tiles_frac_scratch(int device, int KA, int64_t MASK)
+{
+    const at::cuda::CUDAGuard device_guard(device);
+    TORCH_CHECK(KA >= 1 && KA <= 7, "quantize_tiles_frac_scratch: KA must be 1..7");
+    auto launch = qt_frac_launch(device, KA, (uint32_t) MASK);
+    if (!launch.register_kernel) return {false, 128};
+    return {true, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
+}
 
 void quantize_tiles
 (
@@ -282,8 +366,9 @@ void quantize_tiles
 }
 
 // Fractional-rate quantizer, mul1 codebook only: KA bits per position plus one extra bit where the 16-position MASK is set.
-// Costs and history live in the caller's scratch: temp_costs (batch, 2, 65536 >> KA) half,
-// temp_edges (batch, 256, 65536 >> KA) short
+// Generic-kernel scratch is temp_costs (batch, 2, 65536 >> KA) half and temp_edges
+// (batch, 256, 65536 >> KA) short. The register kernel needs only a nonempty costs placeholder
+// and byte history; its two cost rows are in shared memory.
 void quantize_tiles_frac
 (
     at::Tensor input_tiles,
@@ -300,72 +385,48 @@ void quantize_tiles_frac
     TORCH_CHECK_DIM(input_tiles, 2);
     const int L = input_tiles.size(1);
     TORCH_CHECK(L == 256, "quantize_tiles_frac: tile length must be 256");
+    TORCH_CHECK(KA >= 1 && KA <= 7, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_tiles);
     TORCH_CHECK_DTYPE(input_tiles, kFloat);
     TORCH_CHECK_DTYPE(output_tiles, kFloat);
     TORCH_CHECK_DTYPE(output_indices, kShort);
-    TORCH_CHECK_DTYPE(temp_costs, kHalf);
-    TORCH_CHECK_DTYPE(temp_edges, kShort);
     const int edges_max = 65536 >> KA;
-    TORCH_CHECK_DIM(temp_costs, 3);
-    TORCH_CHECK_SIZE(temp_costs, 1, 2);
-    TORCH_CHECK_SIZE(temp_costs, 2, edges_max);
+    const int device = input_tiles.device().index();
+    const auto launch = qt_frac_launch(device, KA, (uint32_t) MASK);
+    TORCH_CHECK_DTYPE(temp_costs, kHalf);
+    if (launch.register_kernel)
+    {
+        TORCH_CHECK(temp_costs.numel() > 0, "quantize_tiles_frac register kernel needs a nonempty costs placeholder");
+        TORCH_CHECK(temp_edges.scalar_type() == at::kByte || temp_edges.scalar_type() == at::kShort,
+                    "quantize_tiles_frac register history must use byte or short storage");
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(temp_edges, kShort);
+        TORCH_CHECK_DIM(temp_costs, 3);
+        TORCH_CHECK_SIZE(temp_costs, 1, 2);
+        TORCH_CHECK_SIZE(temp_costs, 2, edges_max);
+    }
     TORCH_CHECK_DIM(temp_edges, 3);
     TORCH_CHECK_SIZE(temp_edges, 1, L);
     TORCH_CHECK_SIZE(temp_edges, 2, edges_max);
     for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
         TORCH_CHECK(tensor.is_contiguous() && tensor.device() == input_tiles.device(), "quantize_tiles_frac: layout");
-    fp_quantize_tiles_kernel kernel = nullptr;
-    struct { int ka; uint32_t mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
-        {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
-        {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
-        {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
-        {4, 0xaaaau, &quantize_tiles_frac_kernel_a4_maaaa},
-        {5, 0xaaaau, &quantize_tiles_frac_kernel_a5_maaaa},
-        {6, 0xaaaau, &quantize_tiles_frac_kernel_a6_maaaa},
-        {7, 0xaaaau, &quantize_tiles_frac_kernel_a7_maaaa},
-    };
-    for (const auto& e : table) if (e.ka == KA && e.mask == (uint32_t) MASK) kernel = e.fn();
-    TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");
-    // Register-resident variant (bit-identical, see quantize_tiles_frac_reg_kernel.cuh) unless EXL3_FRAC_REG=0.
-    // Threads per block: the faster of 512 / 1024 per rate on sm_120, or EXL3_FRAC_REG_NT
-    int threads = 512;
-    {
-        const char* env = getenv("EXL3_FRAC_REG");
-        const char* env_nt = getenv("EXL3_FRAC_REG_NT");
-        struct { int ka; int nt; fp_quantize_tiles_kernel (*fn)(); } const reg[] = {
-            {2, 512, &quantize_tiles_frac_reg_kernel_a2_maaaa_t512}, {2, 1024, &quantize_tiles_frac_reg_kernel_a2_maaaa_t1024},
-            {3, 512, &quantize_tiles_frac_reg_kernel_a3_maaaa_t512}, {3, 1024, &quantize_tiles_frac_reg_kernel_a3_maaaa_t1024},
-            {4, 512, &quantize_tiles_frac_reg_kernel_a4_maaaa_t512}, {4, 1024, &quantize_tiles_frac_reg_kernel_a4_maaaa_t1024},
-            {5, 512, &quantize_tiles_frac_reg_kernel_a5_maaaa_t512}, {5, 1024, &quantize_tiles_frac_reg_kernel_a5_maaaa_t1024},
-            {6, 512, &quantize_tiles_frac_reg_kernel_a6_maaaa_t512}, {6, 1024, &quantize_tiles_frac_reg_kernel_a6_maaaa_t1024},
-            {7, 512, &quantize_tiles_frac_reg_kernel_a7_maaaa_t512}, {7, 1024, &quantize_tiles_frac_reg_kernel_a7_maaaa_t1024},
-        };
-        // Measured with frac_reg_test.py: 1024 for KA 2-4 (byte-history stores dominate), 512 for 5-7 (no spills)
-        const int best_nt[8] = {0, 0, 1024, 1024, 1024, 512, 512, 512};
-        const int nt = env_nt ? atoi(env_nt) : (KA >= 0 && KA < 8 ? best_nt[KA] : 0);
-        if (!(env && env[0] == '0') && (uint32_t) MASK == 0xaaaau)
-            for (const auto& e : reg) if (e.ka == KA && e.nt == nt) { kernel = e.fn(); threads = nt; }
-    }
     const int num_tiles = input_tiles.size(0);
     if (!num_tiles) return;
-    const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128 + (QTF_SMEM_COSTS(KA) ? 2 * edges_max * (int) sizeof(half) : 0);
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
-    // Launch whole waves: the scratch holds 128 tiles, but 128 blocks at 1-2 resident per SM leave the last wave
-    // partly idle; round the batch down to a multiple of the co-resident block count (measured per instance)
-    int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
-    {
-        int device, per_sm = 0;
-        cuda_check(cudaGetDevice(&device));
-        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, shmem));
-        const int wave = per_sm * DevCtx::instance().get_num_sms(device);
-        if (wave > 0 && max_batch_size >= wave) max_batch_size -= max_batch_size % wave;
-    }
+    // Launch whole waves when scratch can hold one; this avoids a partial resident wave on both the
+    // register scratch (one wave) and the generic 128-tile fallback.
+    int max_batch_size = launch.register_kernel
+        ? (int) temp_edges.size(0)
+        : (int) MIN(temp_costs.size(0), temp_edges.size(0));
+    const int wave = launch.blocks_per_sm * DevCtx::instance().get_num_sms(device);
+    if (wave > 0 && max_batch_size >= wave) max_batch_size -= max_batch_size % wave;
+    TORCH_CHECK(max_batch_size > 0, "quantize_tiles_frac scratch must hold at least one tile");
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);
-        kernel<<<bsz, threads, shmem, stream>>>
+        launch.kernel<<<bsz, launch.threads, launch.shmem, stream>>>
         (
             ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
             ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,
