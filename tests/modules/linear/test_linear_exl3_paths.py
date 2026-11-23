@@ -13,9 +13,15 @@ path, and test_auto_reconstruct_dispatch checks the threshold rule itself.
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from exllamav3.modules import Linear
-from exllamav3.modules.quant.exl3 import AUTO_RECONSTRUCT_THRESHOLD, MAX_RECONSTRUCT_SLICE_N
+from exllamav3.modules.quant.exl3 import (
+    AUTO_RECONSTRUCT_THRESHOLD,
+    MAX_RECONSTRUCT_SLICE_N,
+    SM120_QWEN38_GATE_PACKED_ROWS,
+    LinearEXL3,
+)
 
 from testlib.checkpoint import module_config
 from testlib.exl3 import CODEBOOKS, checkpoint_tensors, generator, linear_ref
@@ -119,3 +125,33 @@ def test_auto_reconstruct_dispatch(tmp_path, device):
             assert recon == expect, f"{name}, rows {rows}: reconstruct path taken = {recon}"
             _, recon = spies[name].took_reconstruct(lambda: module.forward(x, {"reconstruct": True}))
             assert recon, f"{name}, rows {rows}: reconstruct requested but not taken"
+
+
+@torch.inference_mode()
+def test_sm120_qwen38_gate_dispatch_matches_measured_cutoff(device):
+    is_sm120 = torch.cuda.get_device_capability(device) == (12, 0)
+
+    def fake_linear(in_features=5120, out_features=17408, K=4, mul1=True):
+        return SimpleNamespace(
+            key="model.language_model.layers.0.mlp.gate_proj",
+            config=SimpleNamespace(infer_params=SimpleNamespace(no_reconstruct=False)),
+            in_features=in_features,
+            out_features=out_features,
+            K=K,
+            mul1=mul1,
+            default_out_dtype=torch.float16,
+            bc=SimpleNamespace(run_alloc=lambda *args: "packed"),
+            reconstruct_hgemm=lambda *args: "reconstruct",
+        )
+
+    candidate = fake_linear()
+    for rows in (AUTO_RECONSTRUCT_THRESHOLD, 160, SM120_QWEN38_GATE_PACKED_ROWS,
+                 SM120_QWEN38_GATE_PACKED_ROWS + 1):
+        x = torch.empty((rows, 5120), device=device, dtype=torch.float16)
+        result = LinearEXL3.forward(candidate, x, {"reconstruct": False})
+        use_packed = rows <= AUTO_RECONSTRUCT_THRESHOLD or (is_sm120 and rows <= SM120_QWEN38_GATE_PACKED_ROWS)
+        assert result == ("packed" if use_packed else "reconstruct")
+
+    unrelated = fake_linear(out_features=16384)
+    x = torch.empty((160, 5120), device=device, dtype=torch.float16)
+    assert LinearEXL3.forward(unrelated, x, {"reconstruct": False}) == "reconstruct"

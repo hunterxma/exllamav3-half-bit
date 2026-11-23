@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import lru_cache
 import torch
 from ...model.config import Config
 from .exl3_lib.quantize import frac_k, preapply_had_l_, preapply_had_r_, had_k, had_n
@@ -9,6 +10,8 @@ from ...util import profile_opt
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
+# H500 Qwen3.8 first-layer gate, RTX 5060 Ti: packed beats reconstruction through this measured row count.
+SM120_QWEN38_GATE_PACKED_ROWS = 256
 # Cap on the fp16 weight a prefill reconstruct materialises at once (EXL3_RECON_TEMP_MB, default 64): wider matrices are
 # reconstructed and multiplied in 128-column slices. Same arithmetic per output column; the peak drops from k*n*2 bytes
 # (170 MiB for a 17408 x 5120 down projection) to the cap, which is what lets a 15.4 GB model keep 24k context on 16 GB
@@ -19,6 +22,11 @@ no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 # Offline scoring (many rows through one loaded module): keep the original-basis fp16 weight for the life of the module instead of
 # rebuilding it for every row. Off by default (serving never wants the extra VRAM); ear_eval/swap_eval switch it on.
 cache_full_weight = os.environ.get("EXL3_CACHE_FULL_WEIGHT", "0") != "0"
+
+
+@lru_cache(maxsize=None)
+def _is_sm120(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) == (12, 0)
 
 class LinearEXL3:
 
@@ -145,7 +153,19 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            use_packed = rows <= AUTO_RECONSTRUCT_THRESHOLD
+            if (
+                not use_packed
+                and rows <= SM120_QWEN38_GATE_PACKED_ROWS
+                and self.in_features == 5120
+                and self.out_features == 17408
+                and self.K == 4
+                and self.mul1
+                and x.device.type == "cuda"
+            ):
+                device_index = torch.cuda.current_device() if x.device.index is None else x.device.index
+                use_packed = _is_sm120(device_index)
+            if use_packed or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
