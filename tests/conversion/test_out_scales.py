@@ -346,7 +346,8 @@ def quantized_channel_error(weight, out_scales, hdiag):
 @torch.inference_mode()
 def test_hessian_scales_move_the_error(device):
     torch.manual_seed(7)
-    k, n = 512, 1024
+    # More rows stabilize the empirical quantization-error ratios against the analytic sensitivity model.
+    k, n = 1024, 1024
     weight = torch.randn(k, n, device = device) * (torch.rand(1, n, device = device) * 3.0 + 0.2)
     s = torch.randn(n).exp()
     sw = (s / s.mean() + Q.out_sensitivity_floor).double().to(device)

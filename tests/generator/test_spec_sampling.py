@@ -5,9 +5,6 @@ Speculative sampling with sampled drafts (exllamav3/generator/spec_sampling.py),
 - verify() is lossless: the emitted first token is distributed as the target's p whatever q is, and a draft survives
   with probability sum min(p, q)
 """
-import os
-os.environ["EXL3_FUSED_SAMPLER"] = "0"   # the step-by-step stack, so its distribution can be read before sampling
-
 import pytest
 
 pytestmark = pytest.mark.nogpu
@@ -18,6 +15,14 @@ from exllamav3.generator.sampler.presets import ComboSampler
 from exllamav3.generator import spec_sampling as sp
 
 V = 512
+
+
+@pytest.fixture(autouse=True)
+def _stepwise_sampler(monkeypatch):
+    # custom.py may already be imported by collection before this file is loaded, so an environment
+    # change here is too late. The CPU distribution test needs to inspect each step explicitly.
+    from exllamav3.generator.sampler import custom
+    monkeypatch.setattr(custom, "fused_sampler_enable", False)
 
 
 def stack_dist(sampler, logits):

@@ -45,6 +45,7 @@ def test_shared_schedule(rows, pending, tp, offload):
         events.append("tp")
 
     layer = SimpleNamespace(
+        _is_tier = False, _tier = None, _tier_merged = False,
         alt_residual_channel = False, hidden_size = 4, expert_size = 4, bc = None,
         router_pre_norm = None, routed_pre_norm = None, latent_in = None, latent_out = None,
         routing_gate = object(), routing_cfg = None,
@@ -83,6 +84,7 @@ def test_fused_shared_expert_is_not_run_twice():
         pytest.fail("shared expert was already evaluated by the fused path")
 
     layer = SimpleNamespace(
+        _is_tier = False, _tier = None, _tier_merged = False,
         alt_residual_channel = False, hidden_size = 4, expert_size = 4,
         bc = SimpleNamespace(run_bszN = fused), bc_sh_exp = True,
         experts_cfg = SimpleNamespace(out_bszn = output), f_threshold = 128,
