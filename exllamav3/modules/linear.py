@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import cached_property
 from typing_extensions import override
+import os
 import torch
 import numpy as np
 from ..model.config import Config
@@ -30,6 +31,9 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     # (silent on a warm allocator, illegal-memory-access on a freshly initialized device)
     w = w * torch.exp2(scales.float() - 127.0).unsqueeze(-1)
     return w.view(blocks.shape[0], -1).half()
+
+
+_LORA_FAST = os.environ.get("EXL3_LORA_FAST", "1") != "0"
 
 
 class Linear(Module):
@@ -790,10 +794,18 @@ class Linear(Module):
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
         orig_shape = lora_input.shape
         flat = lora_input.view(-1, orig_shape[-1])
+        # Fast path (default): x += (input @ A) @ B as ONE in-place addmm, no [tokens, out] temporary and no separate elementwise add.
+        # EXL3_LORA_FAST=0 restores the original two-matmul + add path (used for the interleaved A/B speed test).
+        fast = _LORA_FAST and x.is_contiguous()
+        out = x.view(-1, x.shape[-1]) if fast else None
         for lora, a in self.lora_a_tensors.items():
             b = self.lora_b_tensors.get(lora)
-            if b is not None:
-                lora_in = flat if flat.dtype == a.dtype else flat.to(a.dtype)
+            if b is None:
+                continue
+            lora_in = flat if flat.dtype == a.dtype else flat.to(a.dtype)
+            if out is not None and out.dtype == b.dtype and out.shape[-1] == b.shape[-1]:
+                out.addmm_(lora_in @ a, b)
+            else:
                 delta = lora_in @ a @ b
                 x += delta.view(*orig_shape[:-1], -1).to(x.dtype)
 
