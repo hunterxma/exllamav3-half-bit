@@ -573,7 +573,6 @@ class SafetensorsCollection:
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
-        assert self.new_tensors is None
         # The prefix names a module ("vision_model"); with a trailing separator the trie lookup below
         # would ask for "vision_model.." and silently match nothing (the pre-trie search accepted both)
         prefix = prefix.rstrip(".")
@@ -596,6 +595,23 @@ class SafetensorsCollection:
             }
             if not only_serializable:
                 results[key]["torch_dtype"] = dtype
+        # During conversion, module.load() receives the just-quantized tensors through
+        # new_tensors. Load-time layout selection (including GPU rate-tier splitting) still
+        # asks for tensor shapes, so expose that active source and let it override old headers
+        # exactly as get_tensor() does.
+        if self.new_tensors:
+            source_prefix = prefix + "."
+            source_keys = ([prefix] if prefix in self.new_tensors else [])
+            source_keys.extend(k for k in self.new_tensors if k.startswith(source_prefix))
+            for key in source_keys:
+                tensor = self.new_tensors[key]
+                results[key] = {
+                    "shape": list(tensor.shape),
+                    "n_bytes": tensor.numel() * tensor.element_size(),
+                    "dtype": str(tensor.dtype),
+                }
+                if not only_serializable:
+                    results[key]["torch_dtype"] = tensor.dtype
         return results
 
 
